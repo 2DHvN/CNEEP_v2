@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class CNEEP(nn.Module):
-    def __init(self, opt):
+    def __init__(self, opt):
         super(CNEEP, self).__init__()
         self.n_layer = opt.n_layer
         self.init_channel = opt.n_channel
@@ -13,7 +13,7 @@ class CNEEP(nn.Module):
         tmp = nn.Sequential()
         tmp.add_module("conv",
                        nn.Conv2d(opt.seq_len, opt.n_channel,
-                                 kernel_size=5, stride=1, paddin=2))
+                                 kernel_size=5, stride=1, padding=2))
         tmp.add_module("relu", nn.ReLU(inplace=True))
         tmp.add_module("maxpool",
                        nn.MaxPool2d(kernel_size=2, stride=2))
@@ -22,12 +22,12 @@ class CNEEP(nn.Module):
         for i in range(opt.n_layer - 1):
             tmp = nn.Sequential()
             tmp.add_module("conv1",
-                           nn.Conv2d(opt.channel * (2 ** i), opt.n_channel * (2 ** i),
+                           nn.Conv2d(opt.n_channel * (2 ** i), opt.n_channel * (2 ** i),
                                      kernel_size=3, stride=1, padding=1))
             tmp.add_module("relu1", nn.ReLU(inplace=True))
 
             tmp.add_module("conv2",
-                           nn.Conv2d(opt.n_channle * (2 ** i), opt.n_channel * (2 ** (i + 1)),
+                           nn.Conv2d(opt.n_channel * (2 ** i), opt.n_channel * (2 ** (i + 1)),
                                      kernel_size=3, stride=1, padding=1))
             tmp.add_module("relu2", nn.ReLU(inplace=True))
 
