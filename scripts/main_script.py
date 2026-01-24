@@ -3,8 +3,15 @@ import numpy as np
 import os
 import torch
 import torchvision
-import torchvision.transforms.functional as TF
 from datetime import datetime
+from utils.sampler import CartesianSampler, CartesianSeqSampler
+from models.CNEEP_0 import CNEEP
+from models.train import train
+from models.validate import validate
+
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
 ###########################################################################
 
@@ -64,19 +71,6 @@ if not os.path.exists(result_folder): os.makedirs(result_folder)
 # After this line, you generally don't need to change anything
 ###########################################################################
 
-
-
-from utils.sampler import CartesianSampler, CartesianSeqSampler
-from scipy import stats
-from models.CNEEP_0 import CNEEP
-from models.train import train
-from models.validate import validate
-
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-import seaborn as sns
-import matplotlib as mpl
 
 #
 # Loading MIPS data (single video version)
