@@ -66,7 +66,7 @@ class CNEEP(nn.Module):
         tmp.add_module("conv", nn.Conv2d(opt.n_channel, 1, kernel_size=5, stride=1, padding=2))
         setattr(self, "r_layer1", tmp)
 
-        self.mask = nn.Parameter(torch.ones(1, 1, opt.H, opt.W))
+        self.mask = nn.Parameter(torch.ones(1, 1, *opt.input_shape))
         nn.init.normal_(self.mask, mean=1.0, std=1e-2)
 
         # initialize parameters
