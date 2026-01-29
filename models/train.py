@@ -11,6 +11,7 @@ def train(opt, model, optim, trajs, sampler, transform):
     x = transform(
         torch.cat([trajs.to(opt.device)[(batch[0], batch[1][i])] for i in range(opt.seq_len)], dim=1).float().to(
             opt.device))
+
     delta = x[:, 0, :, :] - x[:, 1, :, :]
 
     # core variables

@@ -1,18 +1,20 @@
 import torch
 import torch.nn as nn
+from utils.add_position import add_xy_channels
 
 class CNEEP(nn.Module):
     def __init__(self, opt):
         super(CNEEP, self).__init__()
         self.n_layer = opt.n_layer
         self.init_channel = opt.n_channel
+        self.positional = opt.positional
 
         #
         # encoding layer
         #
         tmp = nn.Sequential()
         tmp.add_module("conv",
-                       nn.Conv2d(opt.seq_len, opt.n_channel,
+                       nn.Conv2d(opt.seq_len + (2 if opt.positional else 0), opt.n_channel,
                                  kernel_size=5, stride=1, padding=2))
         tmp.add_module("relu", nn.ReLU(inplace=True))
         tmp.add_module("maxpool",
@@ -64,7 +66,8 @@ class CNEEP(nn.Module):
         tmp.add_module("conv", nn.Conv2d(opt.n_channel, 1, kernel_size=5, stride=1, padding=2))
         setattr(self, "r_layer1", tmp)
 
-        # TODO: FCN layer
+        self.mask = nn.Parameter(torch.ones(1, 1, opt.H, opt.W))
+        nn.init.normal_(self.mask, mean=1.0, std=1e-2)
 
         # initialize parameters
         for m in self.modules():
@@ -91,8 +94,12 @@ class CNEEP(nn.Module):
         delta = x[:, 0, :, :] - x[:, 1, :, :]
         delta = delta.reshape(x.shape[0], 1, x.shape[2], x.shape[3])
 
+        if self.positional:
+            x_ = add_xy_channels(x_)
+            _x = add_xy_channels(_x)
+
         x_ = self.H(x_)
         _x = self.H(_x)
 
-        return (x_ + _x) * delta
+        return (x_ + _x) * delta * self.mask
 

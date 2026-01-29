@@ -27,6 +27,8 @@ opt.alpha   = -0.5
 opt.lam     = 0.0
 opt.threshold = 0.01
 
+opt.positional = True
+
 opt.latent_size = 10
 
 # gradient descent parameters
