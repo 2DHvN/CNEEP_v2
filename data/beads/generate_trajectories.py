@@ -37,8 +37,8 @@ class NBeadsModel:
         self,
         n_beads: int = 3,
         k: float = 1.0,
-        gamma: float = 1.0,
-        T_hot: float = 2.0,
+        gamma: float = 3.0,
+        T_hot: float = 10.0,
         T_cold: float = 1.0,
         dt: float = 0.01,
         boundary: str = "free"

@@ -24,7 +24,7 @@ from generate_trajectories import NBeadsModel
 def generate_brownian_frames(
     trajectory: np.ndarray,
     cell_size: int,
-    skip_frames: int,
+    skip_frames: int=1,
     sigma: float = 2.0
 ):
     """
