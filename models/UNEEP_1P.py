@@ -27,7 +27,7 @@ class CNEEP(nn.Module):
         tmp.add_module("periodic_pad", PeriodicPad2d(padding=2))
         tmp.add_module("conv",
                        nn.Conv2d(opt.seq_len + (2 if opt.positional else 0), opt.n_channel,
-                                 kernel_size=5, stride=1, padding=2))
+                                 kernel_size=5, stride=1, padding=0))
         tmp.add_module("relu", nn.ReLU(inplace=True))
         tmp.add_module("maxpool",
                        nn.MaxPool2d(kernel_size=2, stride=2))

@@ -80,6 +80,9 @@ class NBeadsModel:
         self.coupling_matrix = np.zeros((n, n))
         
         for i in range(n):
+            if i == 0 or i == n-1:
+                self.coupling_matrix[i, i] -= self.k
+
             if i > 0:
                 self.coupling_matrix[i, i - 1] = self.k
                 self.coupling_matrix[i, i] -= self.k
@@ -208,18 +211,24 @@ class NBeadsModel:
             
             # Velocity of each bead (using finite difference)
             velocity = (pos_next - pos) / self.dt
+
+            # Stratonovich convention
+            mid = (pos + pos_next) / 2
             
             for i in range(self.n_beads):
                 # Compute spring force on bead i
                 force_i = 0.0
+
+                if i == 0 or i == self.n_beads-1:
+                    force_i -= self.k * mid[i]
                 
                 # Spring from left neighbor (i-1) if exists
                 if i > 0:
-                    force_i += self.k * (pos[i - 1] - pos[i])
+                    force_i += self.k * (mid[i - 1] - mid[i])
                 
                 # Spring from right neighbor (i+1) if exists
                 if i < self.n_beads - 1:
-                    force_i += self.k * (pos[i + 1] - pos[i])
+                    force_i += self.k * (mid[i + 1] - mid[i])
                 
                 # Heat = Force · velocity · dt (work done on bead i)
                 heat_per_bead[t, i] = force_i * velocity[i] * self.dt

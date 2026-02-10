@@ -134,7 +134,7 @@ def main():
     )
 
     parser.add_argument("--n_beads", type=int, default=2)
-    parser.add_argument("--n_steps", type=int, default=5000)
+    parser.add_argument("--n_steps", type=int, default=1000)
     parser.add_argument("--burn_in", type=int, default=2000)
 
     parser.add_argument("--k", type=float, default=1.0)
@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--dt", type=float, default=0.01)
 
     parser.add_argument("--cell_size", type=int, default=20)
-    parser.add_argument("--skip_frames", type=int, default=10)
+    parser.add_argument("--skip_frames", type=int, default=1)
     parser.add_argument("--sigma", type=float, default=2.0)
     parser.add_argument("--fps", type=int, default=20)
 
