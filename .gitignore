@@ -213,3 +213,8 @@ data/mips_long.mp4
 *.mp4
 *.png
 *.npz
+*.npy
+*.pth.tar
+*.tar
+
+results/
