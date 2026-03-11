@@ -20,3 +20,16 @@ def add_xy_channels(x):
     yy = yy.unsqueeze(0).unsqueeze(0).repeat(B, 1, 1, 1)
 
     return torch.cat([x, xx, yy], dim=1)
+
+def add_x_channel(x):
+    """
+    x: (B, C, L)
+    return: (B, C+1, L)
+    """
+    B, C, L = x.shape
+    device = x.device
+
+    xx = torch.linspace(-1, 1, L, device=device)
+    xx = xx.unsqueeze(0).unsqueeze(0).repeat(B, 1, 1)
+
+    return torch.cat([x, xx], dim=1)

@@ -16,6 +16,7 @@ where:
 """
 
 import numpy as np
+import torch
 from pathlib import Path
 from typing import Optional
 import argparse
@@ -37,11 +38,12 @@ class NBeadsModel:
         self,
         n_beads: int = 3,
         k: float = 1.0,
-        gamma: float = 3.0,
+        gamma: float = 1.0,
         T_hot: float = 10.0,
         T_cold: float = 1.0,
         dt: float = 0.01,
-        boundary: str = "free"
+        boundary: str = "free",
+        device: str = "cpu"
     ):
         """
         Initialize the N-Beads model.
@@ -54,43 +56,64 @@ class NBeadsModel:
             T_cold: Temperature at the other end (bead N-1).
             dt: Integration time step.
             boundary: Boundary condition - "free" or "fixed".
+            device: Computing device ('cpu' or 'cuda').
         """
         self.n_beads = n_beads
         self.k = k
         self.gamma = gamma
         self.dt = dt
         self.boundary = boundary
-        self.coupling_matrix: np.ndarray
+        self.device = torch.device(device)
+        self.coupling_matrix: torch.Tensor
+        self.coupling_matrix_np: np.ndarray
         
         # Linear temperature gradient from T_hot to T_cold
-        self.temperatures = np.linspace(T_hot, T_cold, n_beads)
+        self.temperatures_np = np.linspace(T_hot, T_cold, n_beads)
+        self.temperatures = torch.tensor(self.temperatures_np, dtype=torch.float32, device=self.device)
         
-        # Diffusion coefficients D_i = k_B * T_i / gamma (setting k_B = 1)
-        self.diffusion_coeffs = self.temperatures / gamma
+        # Diffusion coefficients D_i = k_B * T_i  (setting k_B = 1)
+        self.diffusion_coeffs_np = self.temperatures_np
+        self.diffusion_mat_np = np.diag(self.diffusion_coeffs_np)
+        
+        self.diffusion_coeffs = self.temperatures
+        self.diffusion_mat = torch.diag(self.diffusion_coeffs)
         
         # Noise amplitude: sqrt(2 * D_i * dt)
-        self.noise_amplitudes = np.sqrt(2 * self.diffusion_coeffs * dt)
+        self.noise_amplitudes = torch.sqrt(2 * self.diffusion_coeffs * dt)
         
         # Build the coupling matrix for spring forces
         self._build_coupling_matrix()
-    
+
+    def _build_cov(self):
+        from scipy.linalg import solve_continuous_lyapunov
+
+        # Continuous ODE: dx = (A/gamma)x dt + sqrt(2D) dW
+        # So drift M = A/gamma, process noise var Q = 2D
+        # Lyapunov eq: M * Cov + Cov * M^T + Q = 0
+        drift = self.coupling_matrix_np / self.gamma
+        noise_var = 2 * self.diffusion_mat_np
+
+        cov_mat_np = solve_continuous_lyapunov(-drift, noise_var)
+        self.cov_mat_np = cov_mat_np
+        self.cov_mat = torch.tensor(cov_mat_np, dtype=torch.float32, device=self.device)
+        return self.cov_mat_np
+
     def _build_coupling_matrix(self):
         """Build the coupling matrix for spring forces."""
         n = self.n_beads
-        self.coupling_matrix = np.zeros((n, n))
+        self.coupling_matrix_np = np.zeros((n, n))
         
         for i in range(n):
-            if i == 0 or i == n-1:
-                self.coupling_matrix[i, i] -= self.k
+            self.coupling_matrix_np[i, i] = -2 * self.k
 
             if i > 0:
-                self.coupling_matrix[i, i - 1] = self.k
-                self.coupling_matrix[i, i] -= self.k
+                self.coupling_matrix_np[i, i - 1] = self.k
             if i < n - 1:
-                self.coupling_matrix[i, i + 1] = self.k
-                self.coupling_matrix[i, i] -= self.k
-    
-    def compute_forces(self, positions: np.ndarray) -> np.ndarray:
+                self.coupling_matrix_np[i, i + 1] = self.k
+                
+        self.coupling_matrix = torch.tensor(self.coupling_matrix_np, dtype=torch.float32, device=self.device)
+
+    def compute_forces(self, positions: torch.Tensor) -> torch.Tensor:
         """
         Compute forces on all beads.
         
@@ -105,7 +128,7 @@ class NBeadsModel:
         else:
             return positions @ self.coupling_matrix.T
     
-    def step(self, positions: np.ndarray) -> np.ndarray:
+    def step(self, positions: torch.Tensor) -> torch.Tensor:
         """
         Perform one Euler-Maruyama integration step.
         
@@ -116,7 +139,7 @@ class NBeadsModel:
             New positions after one time step.
         """
         forces = self.compute_forces(positions)
-        noise = np.random.randn(*positions.shape) * self.noise_amplitudes
+        noise = torch.randn_like(positions) * self.noise_amplitudes
         
         # Euler-Maruyama: x_new = x + (F/gamma) * dt + noise
         new_positions = positions + (forces / self.gamma) * self.dt + noise
@@ -140,22 +163,27 @@ class NBeadsModel:
         Returns:
             Trajectory array of shape (n_steps, n_beads).
         """
+        if getattr(self, 'cov_mat', None) is None:
+            self._build_cov()
+            
         if initial_positions is None:
-            positions = np.zeros(self.n_beads)
+            from torch.distributions.multivariate_normal import MultivariateNormal
+            dist = MultivariateNormal(torch.zeros(self.n_beads, device=self.device), self.cov_mat)
+            positions = dist.sample()
         else:
-            positions = initial_positions.copy()
+            positions = torch.tensor(initial_positions, dtype=torch.float32, device=self.device)
         
         # Burn-in period
         for _ in range(burn_in):
             positions = self.step(positions)
         
         # Generate trajectory
-        trajectory = np.zeros((n_steps, self.n_beads))
+        trajectory = torch.zeros((n_steps, self.n_beads), device=self.device)
         for t in range(n_steps):
             trajectory[t] = positions
             positions = self.step(positions)
         
-        return trajectory
+        return trajectory.cpu().numpy()
     
     def generate_trajectories(
         self,
@@ -165,7 +193,7 @@ class NBeadsModel:
         show_progress: bool = True
     ) -> np.ndarray:
         """
-        Generate multiple independent trajectories.
+        Generate multiple independent trajectories simultaneously using PyTorch matrix operations.
         
         Args:
             n_trajectories: Number of trajectories to generate.
@@ -174,33 +202,36 @@ class NBeadsModel:
             show_progress: Whether to show progress.
             
         Returns:
-            Array of shape (n_trajectories, n_steps, n_beads).
+            Array of shape (n_trajectories, n_steps, n_beads) on CPU as NumPy array.
         """
-        trajectories = np.zeros((n_trajectories, n_steps, self.n_beads))
+        if getattr(self, 'cov_mat', None) is None:
+            self._build_cov()
+            
+        from torch.distributions.multivariate_normal import MultivariateNormal
+        dist = MultivariateNormal(torch.zeros(self.n_beads, device=self.device), self.cov_mat)
+        positions = dist.sample((n_trajectories,))
         
-        for i in range(n_trajectories):
-            if show_progress and (i + 1) % max(1, n_trajectories // 10) == 0:
-                print(f"Generating trajectory {i + 1}/{n_trajectories}")
-            trajectories[i] = self.generate_trajectory(n_steps, burn_in=burn_in)
-        
-        return trajectories
+        # Burn-in period
+        for _ in range(burn_in):
+            positions = self.step(positions)
+            
+        # Generate the trajectories
+        trajectories = torch.zeros((n_steps, n_trajectories, self.n_beads), device=self.device)
+        for t in range(n_steps):
+            trajectories[t] = positions
+            positions = self.step(positions)
+            
+            if show_progress and (t + 1) % max(1, n_steps // 10) == 0:
+                print(f"Generating step {t + 1}/{n_steps}", end="\r")
+                
+        if show_progress:
+            print()
+            
+        return trajectories.transpose(0, 1).cpu().numpy()
     
     def compute_heat_per_bead(self, trajectory: np.ndarray) -> np.ndarray:
         """
         Compute the heat flow into each bead at each time step.
-        
-        For bead i, the heat flow Q_i is the work done by spring forces on that bead:
-            Q_i = F_i · v_i = [k(x_{i-1} - x_i) + k(x_{i+1} - x_i)] · v_i
-        
-        For boundary beads:
-            - Bead 0: Q_0 = k(x_1 - x_0) · v_0
-            - Bead N-1: Q_{N-1} = k(x_{N-2} - x_{N-1}) · v_{N-1}
-        
-        Args:
-            trajectory: Trajectory of shape (n_steps, n_beads).
-            
-        Returns:
-            Heat flow per bead, shape (n_steps - 1, n_beads).
         """
         n_steps = trajectory.shape[0]
         heat_per_bead = np.zeros((n_steps - 1, self.n_beads))
@@ -238,64 +269,47 @@ class NBeadsModel:
     def compute_entropy_production_per_bead(self, trajectory: np.ndarray) -> np.ndarray:
         """
         Compute the entropy production decomposed by each bead.
-        
-        Following the formulation from "Attaining entropy production and dissipation 
-        maps from Brownian movies via neural networks", the entropy production 
-        contribution from bead i is:
-            σ_i = Q_i / T_i
-        
-        where Q_i is the heat flow into bead i and T_i is its temperature.
-        
-        Args:
-            trajectory: Trajectory of shape (n_steps, n_beads).
-            
-        Returns:
-            Entropy production per bead, shape (n_steps - 1, n_beads).
         """
         heat_per_bead = self.compute_heat_per_bead(trajectory)
         
         # σ_i = Q_i / T_i for each bead
-        entropy_per_bead = heat_per_bead / self.temperatures[np.newaxis, :]
+        entropy_per_bead = heat_per_bead / self.temperatures_np[np.newaxis, :]
         
         return entropy_per_bead
     
     def compute_entropy_production_rate(self, trajectory: np.ndarray) -> np.ndarray:
         """
         Compute the total instantaneous entropy production rate for a trajectory.
-        
-        The total entropy production rate is the sum over all beads:
-            σ = Σ_i Q_i / T_i
-        
-        Args:
-            trajectory: Trajectory of shape (n_steps, n_beads).
-            
-        Returns:
-            Total entropy production rate at each time step, shape (n_steps - 1,).
         """
         entropy_per_bead = self.compute_entropy_production_per_bead(trajectory)
         return np.sum(entropy_per_bead, axis=1)
     
+    def compute_system_entropy(self, trajectory: np.ndarray) -> np.ndarray:
+        """
+        Compute the system entropy s(x) = -log p(x) for the trajectory using the steady state distribution.
+        """
+        if getattr(self, 'cov_mat_np', None) is None:
+            self._build_cov()
+            
+        cov_inv = np.linalg.inv(self.cov_mat_np)
+        
+        # -log p(x) = 0.5 * x^T Cov^-1 x + 0.5 * n * log(2pi) + 0.5 * log(det(Cov))
+        n = self.n_beads
+        term1 = 0.5 * np.sum((trajectory @ cov_inv) * trajectory, axis=1)
+        term2 = 0.5 * n * np.log(2 * np.pi)
+        term3 = 0.5 * np.linalg.slogdet(self.cov_mat_np)[1]
+        
+        return term1 + term2 + term3
+    
     def compute_mean_entropy_production(self, trajectory: np.ndarray) -> float:
         """
         Compute the mean entropy production rate for a trajectory.
-        
-        Args:
-            trajectory: Trajectory of shape (n_steps, n_beads).
-            
-        Returns:
-            Mean entropy production rate.
         """
         return np.mean(self.compute_entropy_production_rate(trajectory))
     
     def compute_total_entropy_production(self, trajectory: np.ndarray) -> float:
         """
         Compute the total entropy production for a trajectory.
-        
-        Args:
-            trajectory: Trajectory of shape (n_steps, n_beads).
-            
-        Returns:
-            Total entropy production.
         """
         return np.sum(self.compute_entropy_production_rate(trajectory))
 
@@ -307,11 +321,6 @@ def save_trajectories(
 ):
     """
     Save trajectories to file.
-    
-    Args:
-        trajectories: Array of shape (n_trajectories, n_steps, n_beads).
-        output_path: Path to save the file.
-        metadata: Optional dictionary of metadata to include.
     """
     save_dict = {'trajectories': trajectories}
     if metadata is not None:
@@ -322,22 +331,24 @@ def save_trajectories(
 
 def main():
     parser = argparse.ArgumentParser(description="Generate N-Beads model trajectories")
-    parser.add_argument("--n_beads", type=int, default=3, help="Number of beads")
-    parser.add_argument("--n_trajectories", type=int, default=100, help="Number of trajectories")
+    parser.add_argument("--n_beads", type=int, default=2, help="Number of beads")
+    parser.add_argument("--n_trajectories", type=int, default=10, help="Number of trajectories")
     parser.add_argument("--n_steps", type=int, default=10000, help="Steps per trajectory")
-    parser.add_argument("--burn_in", type=int, default=5000, help="Burn-in steps")
+    parser.add_argument("--burn_in", type=int, default=0, help="Burn-in steps")
     parser.add_argument("--k", type=float, default=1.0, help="Spring constant")
     parser.add_argument("--gamma", type=float, default=1.0, help="Friction coefficient")
-    parser.add_argument("--T_hot", type=float, default=2.0, help="Hot reservoir temperature")
+    parser.add_argument("--T_hot", type=float, default=10.0, help="Hot reservoir temperature")
     parser.add_argument("--T_cold", type=float, default=1.0, help="Cold reservoir temperature")
     parser.add_argument("--dt", type=float, default=0.01, help="Time step")
     parser.add_argument("--output", type=str, default="trajectories.pt", help="Output file path")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use for simulation")
     
     args = parser.parse_args()
     
     if args.seed is not None:
         np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
     
     print(f"Generating trajectories for {args.n_beads}-beads model...")
     print(f"  Temperature gradient: {args.T_hot} -> {args.T_cold}")
@@ -346,6 +357,7 @@ def main():
     print(f"  Time step: {args.dt}")
     print(f"  Trajectories: {args.n_trajectories}")
     print(f"  Steps per trajectory: {args.n_steps}")
+    print(f"  Device: {args.device}")
     
     # Create model
     model = NBeadsModel(
@@ -354,7 +366,8 @@ def main():
         gamma=args.gamma,
         T_hot=args.T_hot,
         T_cold=args.T_cold,
-        dt=args.dt
+        dt=args.dt,
+        device=args.device
     )
     
     # Generate trajectories
@@ -378,7 +391,8 @@ def main():
         'T_hot': args.T_hot,
         'T_cold': args.T_cold,
         'dt': args.dt,
-        'temperatures': model.temperatures.tolist()
+        'device': args.device,
+        'temperatures': model.temperatures_np.tolist()
     }
     
     # Save

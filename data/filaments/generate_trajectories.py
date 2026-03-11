@@ -60,11 +60,11 @@ class SquareLatticeFilamentModel:
         for t in range(n_steps + burn_in):
             F = np.zeros_like(r)
 
-            # elastic forces
+            # linearized elastic forces: f_ij = k * (u_j - u_i)
+            # u = r - r0 (displacement from equilibrium)
             for i, j in self.bonds:
-                rij = r[j] - r[i]
-                dist = np.linalg.norm(rij) + 1e-12
-                f = self.k * (dist - self.a) * rij / dist
+                du = (r[j] - self.r0[j]) - (r[i] - self.r0[i])
+                f = self.k * du       # (2,) vector, x and y independent
                 F[i] += f
                 F[j] -= f
 
@@ -82,3 +82,103 @@ class SquareLatticeFilamentModel:
                 traj.append(r.copy())
 
         return np.stack(traj)
+
+    # ================================================================
+    # Entropy Production Rate (EPR) computation
+    # ================================================================
+
+    def compute_forces_at(self, positions):
+        """
+        Compute linearized spring forces on all sites.
+
+        F_ij = k * (u_j - u_i),  u = positions - r0
+
+        Parameters
+        ----------
+        positions : (N, 2) ndarray
+
+        Returns
+        -------
+        F : (N, 2) ndarray — net force on each site
+        """
+        F = np.zeros_like(positions)
+        for i, j in self.bonds:
+            du = (positions[j] - self.r0[j]) - (positions[i] - self.r0[i])
+            f = self.k * du
+            F[i] += f
+            F[j] -= f
+        return F
+
+    def compute_heat_per_site(self, trajectory):
+        """
+        Compute heat flow into each site at each time step (Stratonovich convention).
+
+        δQ_i(t) = F_i(r_mid) · Δr_i ,  r_mid = (r_t + r_{t+1}) / 2
+
+        Parameters
+        ----------
+        trajectory : (T, N, 2) ndarray
+
+        Returns
+        -------
+        heat : (T-1, N) ndarray — heat absorbed by each site per step
+        """
+        n_steps = trajectory.shape[0]
+        heat = np.zeros((n_steps - 1, self.N))
+
+        for t in range(n_steps - 1):
+            r_curr = trajectory[t]
+            r_next = trajectory[t + 1]
+            r_mid = (r_curr + r_next) / 2.0
+            dr = r_next - r_curr
+
+            F_mid = self.compute_forces_at(r_mid)
+
+            # δQ_i = F_i · dr_i  (dot product over x,y components)
+            heat[t] = np.sum(F_mid * dr, axis=1)
+
+        return heat
+
+    def compute_entropy_production_per_site(self, trajectory):
+        """
+        Entropy production decomposed by site: σ_i = δQ_i / T_i
+
+        Parameters
+        ----------
+        trajectory : (T, N, 2) ndarray
+
+        Returns
+        -------
+        ep_per_site : (T-1, N) ndarray
+        """
+        heat = self.compute_heat_per_site(trajectory)
+        return heat / self.T[np.newaxis, :]
+
+    def compute_entropy_production_rate(self, trajectory):
+        """
+        Total instantaneous entropy production rate: σ(t) = Σ_i σ_i(t)
+
+        Parameters
+        ----------
+        trajectory : (T, N, 2) ndarray
+
+        Returns
+        -------
+        ep_rate : (T-1,) ndarray
+        """
+        ep_per_site = self.compute_entropy_production_per_site(trajectory)
+        return np.sum(ep_per_site, axis=1)
+
+    def compute_mean_entropy_production(self, trajectory):
+        """
+        Mean entropy production rate over the entire trajectory.
+
+        Parameters
+        ----------
+        trajectory : (T, N, 2) ndarray
+
+        Returns
+        -------
+        mean_ep : float
+        """
+        return float(np.mean(self.compute_entropy_production_rate(trajectory)))
