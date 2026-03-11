@@ -209,3 +209,7 @@ __marimo__/
 data/beads/brownian_movie.mp4
 data/filaments/brownian_movie.mp4
 data/mips_long.mp4
+
+*.mp4
+*.png
+*.npz
