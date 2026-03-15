@@ -88,8 +88,8 @@ class CNEEP(nn.Module):
         x_ = x
         _x = torch.flip(x, [1])
 
-        delta = x[:, 0, :, :] - x[:, 1, :, :]
-        delta = delta.reshape(x.shape[0], 1, x.shape[2], x.shape[3])
+        delta = x[:, 0, :] - x[:, 1, :]
+        delta = delta.reshape(x.shape[0], 1, x.shape[2])
 
         if self.positional:
             x_ = add_x_channel(x_)
