@@ -39,15 +39,32 @@ class CNEEP(nn.Module):
 
             setattr(self, f"layer{i + 2}", tmp)
 
-            # fc layers
-        tempL = opt.input_shape[0]
-        self.fc1 = nn.Linear(
-            opt.n_channel * (2 ** (opt.n_layer - 1)) * (tempL + 1), 1, bias=True)
-        nn.init.xavier_uniform_(self.fc1.weight)
+        #
+        # decoding layer
+        #
+        for i in list(reversed(range(opt.n_layer - 1))):
+            tmp = nn.Sequential()
 
-        self.out = nn.Sequential(
-            self.fc1,
-        )
+            if i < opt.n_layer - 2:
+                tmp.add_module("upsample",
+                               nn.Upsample(scale_factor=2, mode='linear', align_corners=True))
+
+            tmp.add_module("conv1",
+                           nn.Conv1d(opt.n_channel * (2 ** (i + 1)), opt.n_channel * (2 ** i),
+                                     kernel_size=3, stride=1, padding=1))
+            tmp.add_module("elu1", nn.ELU(inplace=True))
+
+            tmp.add_module("conv2",
+                           nn.Conv1d(opt.n_channel * (2 ** i), opt.n_channel * (2 ** i),
+                                     kernel_size=3, stride=1, padding=1))
+            tmp.add_module("elu2", nn.ELU(inplace=True))
+
+            setattr(self, f"r_layer{i+2}", tmp)
+
+        tmp = nn.Sequential()
+        tmp.add_module("upsample", nn.Upsample(scale_factor=2, mode='linear', align_corners=True))
+        tmp.add_module("conv", nn.Conv1d(opt.n_channel, 1, kernel_size=5, stride=1, padding=2))
+        setattr(self, "r_layer1", tmp)
 
         # initialize parameters
         for m in self.modules():
@@ -61,15 +78,18 @@ class CNEEP(nn.Module):
             f = getattr(self, f"layer{i+1}")
             x = f(x)
 
-        batch, channel, length = x.shape
-        x = x.view(batch, -1)
-        x = self.fc1(x)
+        for i in list(reversed(range(self.n_layer))):
+            f = getattr(self, f"r_layer{i+1}")
+            x = f(x)
 
         return x
 
     def forward(self, x):
         x_ = x
-        _x = torch.flip(x, [1])  # Reverse time direction in the sequence length. Assume x is (B, seq_len, L)
+        _x = torch.flip(x, [1])
+
+        delta = x[:, 0, :, :] - x[:, 1, :, :]
+        delta = delta.reshape(x.shape[0], 1, x.shape[2], x.shape[3])
 
         if self.positional:
             x_ = add_x_channel(x_)
@@ -78,4 +98,4 @@ class CNEEP(nn.Module):
         x_ = self.H(x_)
         _x = self.H(_x)
 
-        return x_ - _x
+        return (x_ + _x) * delta

@@ -23,7 +23,7 @@ def validate_1d(opt, model, trajs, sampler, transform):
             maps.append(ent_map.cpu().squeeze().numpy())
 
             loss += (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha + (torch.exp(-(1 + opt.alpha) * ent_production) - 1) / (1 + opt.alpha)).sum().cpu().item()
-    loss = loss * opt.loss_scalar / sampler.size
+    loss = loss / sampler.size
 
     ret = np.concatenate(ret)
     ret = ret.reshape(trajs.shape[0], -1)
