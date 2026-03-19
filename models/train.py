@@ -16,7 +16,7 @@ def train(opt, model, optim, trajs, sampler, transform):
 
     # core variables
     delta = delta.reshape(x.shape[0], 1, x.shape[2], x.shape[3])
-    mapp = model(x)
+    mapp = model(x) / opt.scalar
     ent_production = torch.mean(mapp.reshape(x.shape[0], -1), dim=1)
 
     # regularization term
@@ -29,7 +29,7 @@ def train(opt, model, optim, trajs, sampler, transform):
     # alpha-NEEP loss
     loss = (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha
             + (torch.exp(-(1 + opt.alpha) * ent_production) - 1) / (1 + opt.alpha)).mean()
-    (loss * opt.scalar + R).backward()
+    (loss * opt.loss_scalar + R).backward()
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.clip_norm)
 

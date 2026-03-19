@@ -1,6 +1,16 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from utils.add_position import add_x_channel
+
+
+class PeriodicPad2d(nn.Module):
+    def __init__(self, padding):
+        super(PeriodicPad2d, self).__init__()
+        self.padding = padding
+
+    def forward(self, x):
+        return F.pad(x, (self.padding, self.padding, self.padding, self.padding), mode='circular')
 
 class CNEEP(nn.Module):
     def __init__(self, opt):
@@ -13,9 +23,10 @@ class CNEEP(nn.Module):
         # encoding layer
         #
         tmp = nn.Sequential()
+        tmp.add_module("periodic_pad", PeriodicPad2d(padding=2))
         tmp.add_module("conv",
                        nn.Conv1d(opt.seq_len + (1 if opt.positional else 0), opt.n_channel,
-                                 kernel_size=5, stride=1, padding=2))
+                                 kernel_size=5, stride=1, padding=0))
         tmp.add_module("elu", nn.ELU(inplace=True))
         tmp.add_module("pool",
                        nn.AvgPool1d(kernel_size=2, stride=2))
@@ -23,14 +34,16 @@ class CNEEP(nn.Module):
 
         for i in range(opt.n_layer - 1):
             tmp = nn.Sequential()
+            tmp.add_module("periodic_pad", PeriodicPad2d(padding=1))
             tmp.add_module("conv1",
                            nn.Conv1d(opt.n_channel * (2 ** i), opt.n_channel * (2 ** i),
-                                     kernel_size=3, stride=1, padding=1))
+                                     kernel_size=3, stride=1, padding=0))
             tmp.add_module("elu1", nn.ELU(inplace=True))
 
+            tmp.add_module("periodic_pad", PeriodicPad2d(padding=1))
             tmp.add_module("conv2",
                            nn.Conv1d(opt.n_channel * (2 ** i), opt.n_channel * (2 ** (i + 1)),
-                                     kernel_size=3, stride=1, padding=1))
+                                     kernel_size=3, stride=1, padding=0))
             tmp.add_module("elu2", nn.ELU(inplace=True))
 
             if i < opt.n_layer - 2:
@@ -49,21 +62,25 @@ class CNEEP(nn.Module):
                 tmp.add_module("upsample",
                                nn.Upsample(scale_factor=2, mode='linear', align_corners=True))
 
+            tmp.add_module("periodic_pad", PeriodicPad2d(padding=1))
             tmp.add_module("conv1",
                            nn.Conv1d(opt.n_channel * (2 ** (i + 1)), opt.n_channel * (2 ** i),
-                                     kernel_size=3, stride=1, padding=1))
+                                     kernel_size=3, stride=1, padding=0))
             tmp.add_module("elu1", nn.ELU(inplace=True))
 
+            tmp.add_module("periodic_pad", PeriodicPad2d(padding=1))
             tmp.add_module("conv2",
                            nn.Conv1d(opt.n_channel * (2 ** i), opt.n_channel * (2 ** i),
-                                     kernel_size=3, stride=1, padding=1))
+                                     kernel_size=3, stride=1, padding=0))
             tmp.add_module("elu2", nn.ELU(inplace=True))
 
             setattr(self, f"r_layer{i+2}", tmp)
 
         tmp = nn.Sequential()
         tmp.add_module("upsample", nn.Upsample(scale_factor=2, mode='linear', align_corners=True))
-        tmp.add_module("conv", nn.Conv1d(opt.n_channel, 1, kernel_size=5, stride=1, padding=2))
+
+        tmp.add_module("periodic_pad", PeriodicPad2d(padding=2))
+        tmp.add_module("conv", nn.Conv1d(opt.n_channel, 1, kernel_size=5, stride=1, padding=0))
         setattr(self, "r_layer1", tmp)
 
         # initialize parameters
