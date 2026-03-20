@@ -91,11 +91,19 @@ class CNEEP(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def H(self, x):
-        for i in range(self.n_layer):
+        features = []
+        for i in range(self.n_layer - 1):
             f = getattr(self, f"layer{i+1}")
             x = f(x)
+            features.append(x)
+            
+        f = getattr(self, f"layer{self.n_layer}")
+        x = f(x)
 
         for i in list(reversed(range(self.n_layer))):
+            if i < self.n_layer - 1:
+                x = x + features[i]
+                
             f = getattr(self, f"r_layer{i+1}")
             x = f(x)
 
