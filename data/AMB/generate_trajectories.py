@@ -519,6 +519,46 @@ class ActiveModelB:
 
         return ensemble_epr_density
 
+    def compute_epr_timeseries(self, trajectories):
+        """
+        Ensemble-averaged EPR time series and time-averaged spatial map.
+        Supports (M, T, Lx, Ly) input.
+        """
+        if self.backend == 'torch' and not isinstance(trajectories, torch.Tensor):
+            trajectories = torch.from_numpy(trajectories).to(self.device).double()
+        elif self.backend == 'numpy' and isinstance(trajectories, torch.Tensor):
+            trajectories = trajectories.detach().cpu().numpy()
+
+        M, T, Lx, Ly = trajectories.shape
+        epr_series = np.zeros(T - 1)
+        epr_map_sum = np.zeros((Lx, Ly))
+
+        # Vectorize over M, Lx, Ly; loop over T for memory efficiency
+        if self.epr_mode == "mid":
+            epr_series = np.zeros(T - 2)
+            for t in tqdm(range(T - 2), desc="EPR Timeseries (mid)", leave=False):
+                phi_p = trajectories[:, t]
+                phi_t = trajectories[:, t + 1]
+                phi_n = trajectories[:, t + 2]
+                sigma = self.compute_local_epr_density_three(phi_p, phi_t, phi_n)
+                
+                total_epr = self._sum(sigma, axis=(-2, -1)) * (self.dx**2)
+                epr_series[t] = self._to_numpy(self._mean(total_epr))
+                epr_map_sum += self._to_numpy(self._mean(sigma, axis=0))
+            mean_epr_map = epr_map_sum / (T - 2)
+        else:
+            for t in tqdm(range(T - 1), desc="EPR Timeseries (std)", leave=False):
+                phi_t = trajectories[:, t]
+                phi_tp1 = trajectories[:, t + 1]
+                sigma = self.compute_local_epr_density(phi_t, phi_tp1)
+                
+                total_epr = self._sum(sigma, axis=(-2, -1)) * (self.dx**2)
+                epr_series[t] = self._to_numpy(self._mean(total_epr))
+                epr_map_sum += self._to_numpy(self._mean(sigma, axis=0))
+            mean_epr_map = epr_map_sum / (T - 1)
+
+        return epr_series, mean_epr_map
+
     def compute_epr_density_trajectory(self, trajectory):
         """Local EPR density for every consecutive pair → (T-1, Lx, Ly)."""
         T = trajectory.shape[0]
