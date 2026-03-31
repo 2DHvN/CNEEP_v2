@@ -40,7 +40,7 @@ class ActiveModelB1D:
         backend: str = "numpy",
         use_gpu: bool = False,
         bc: str = "periodic",
-        epr_mode: str = "mid",
+        epr_mode: str = "mid"
     ):
         self.Lx = Lx
         self.dx = dx
@@ -229,13 +229,13 @@ class ActiveModelB1D:
     def compute_local_epr_density(self, phi_t, phi_tp1):
         dphi_dt = (phi_tp1 - phi_t) / self.dt
         phi_mid = 0.5 * (phi_t + phi_tp1)
-        mu_act = self.mu_active(phi_mid)
+        mu_act = self.mu_active(phi_mid) + self._mu_eq(phi_mid)
         # The equation for EPR is - mu_act * dphi_dt / D
         return - mu_act * dphi_dt / self.D
 
     def compute_local_epr_density_three(self, phi_p, phi_t, phi_n):
         dphi_dt = (phi_n - phi_p) / (2 * self.dt)
-        mu_act = self.mu_active(phi_t)
+        mu_act = self.mu_active(phi_t) + self._mu_eq(phi_t)
         return - mu_act * dphi_dt / self.D
 
     def compute_total_epr(self, phi_t, phi_tp1):
