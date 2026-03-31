@@ -21,7 +21,10 @@ def validate(opt, model, trajs, sampler, transform):
             ret.append(entropy)
             maps.append(ent_map.cpu().squeeze().numpy())
 
-            loss += (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha + (torch.exp(-(1 + opt.alpha) * ent_production) - 1) / (1 + opt.alpha)).sum().cpu().item()
+            if opt.alpha == 0:
+                loss += (- ent_production + (torch.exp(-ent_production) - 1)).sum().cpu().item()
+            else:
+                loss += (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha + (torch.exp(-(1 + opt.alpha) * ent_production) - 1) / (1 + opt.alpha)).sum().cpu().item()
     loss = loss / sampler.size
 
 

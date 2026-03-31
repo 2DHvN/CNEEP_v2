@@ -27,8 +27,12 @@ def train(opt, model, optim, trajs, sampler, transform):
     optim.zero_grad()
 
     # alpha-NEEP loss
-    loss = (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha
+    if opt.alpha == 0:
+        loss = (- ent_production + (torch.exp(-ent_production) - 1)).mean()
+    else:
+        loss = (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha
             + (torch.exp(-(1 + opt.alpha) * ent_production) - 1) / (1 + opt.alpha)).mean()
+
     (loss * opt.loss_scalar + R).backward()
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.clip_norm)
