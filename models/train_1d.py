@@ -11,7 +11,7 @@ def train_1d(opt, model, optim, trajs, sampler, transform):
     # trajs shape: (M, L, 1, Lx)
     # x shape after transform and cat: (batch_size, seq_len * channels, Lx)
     x = transform(
-        torch.cat([trajs.to(opt.device)[(batch[0], batch[1][i])] for i in range(opt.seq_len)], dim=1).float().to(
+        torch.cat([trajs[(batch[0], batch[1][i])].to(opt.device) for i in range(opt.seq_len)], dim=1).float().to(
             opt.device))
 
     # delta is the difference between sequential frames

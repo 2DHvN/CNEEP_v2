@@ -14,7 +14,7 @@ def validate_1d(opt, model, trajs, sampler, transform):
     with torch.no_grad():
         for batch in sampler:
             # trajs shape: (M, L, 1, Lx)
-            x = transform(torch.cat([trajs.to(opt.device)[(batch[0], batch[1][i])] for i in range(opt.seq_len)], dim=1).float().to(opt.device))
+            x = transform(torch.cat([trajs[(batch[0], batch[1][i])].to(opt.device) for i in range(opt.seq_len)], dim=1).float().to(opt.device))
 
             ent_map = model(x) / opt.scalar
             ent_production = torch.mean(ent_map.reshape(x.shape[0], -1), dim = 1)
