@@ -13,7 +13,9 @@ def validate(opt, model, trajs, sampler, transform):
     loss = 0
     with torch.no_grad():
         for batch in sampler:
-            x = transform(torch.cat([trajs[(batch[0], batch[1][i])].to(opt.device) for i in range(opt.seq_len)], dim=1).float().to(opt.device))
+            b0 = batch[0].to(trajs.device)
+            slices = [trajs[(b0, batch[1][i].to(trajs.device))] for i in range(opt.seq_len)]
+            x = transform(torch.cat(slices, dim=1).float().to(opt.device))
 
             ent_map = model(x) / opt.scalar
             ent_production = torch.mean(ent_map.reshape(x.shape[0], -1), dim = 1)

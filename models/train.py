@@ -8,9 +8,9 @@ def train(opt, model, optim, trajs, sampler, transform):
     model.train()
     batch = next(sampler)
 
-    x = transform(
-        torch.cat([trajs[(batch[0], batch[1][i])].to(opt.device) for i in range(opt.seq_len)], dim=1).float().to(
-            opt.device))
+    b0 = batch[0].to(trajs.device)
+    slices = [trajs[(b0, batch[1][i].to(trajs.device))] for i in range(opt.seq_len)]
+    x = transform(torch.cat(slices, dim=1).float().to(opt.device))
 
     delta = x[:, 0, :, :] - x[:, 1, :, :]
 
