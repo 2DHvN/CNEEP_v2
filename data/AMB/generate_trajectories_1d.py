@@ -40,7 +40,8 @@ class ActiveModelB1D:
         backend: str = "numpy",
         use_gpu: bool = False,
         bc: str = "periodic",
-        epr_mode: str = "mid"
+        epr_mode: str = "mid",
+        epr_mu_active_only: bool = True
     ):
         self.Lx = Lx
         self.dx = dx
@@ -56,6 +57,7 @@ class ActiveModelB1D:
         self.use_gpu = use_gpu
         self.bc = bc
         self.epr_mode = epr_mode
+        self.epr_mu_active_only = epr_mu_active_only
 
         if backend == 'torch':
             if torch is None:
@@ -229,14 +231,22 @@ class ActiveModelB1D:
     def compute_local_epr_density(self, phi_t, phi_tp1):
         dphi_dt = (phi_tp1 - phi_t) / self.dt
         phi_mid = 0.5 * (phi_t + phi_tp1)
-        mu_act = self.mu_active(phi_mid) # + self._mu_eq(phi_mid)
-        # The equation for EPR is - mu_act * dphi_dt / D
-        return - mu_act * dphi_dt / self.D
+        
+        mu_eff = self.mu_active(phi_mid)
+        if not self.epr_mu_active_only:
+            mu_eff = mu_eff + self._mu_eq(phi_mid)
+            
+        # The equation for EPR is - mu_eff * dphi_dt / D
+        return - mu_eff * dphi_dt / self.D
 
     def compute_local_epr_density_three(self, phi_p, phi_t, phi_n):
         dphi_dt = (phi_n - phi_p) / (2 * self.dt)
-        mu_act = self.mu_active(phi_t) # + self._mu_eq(phi_t)
-        return - mu_act * dphi_dt / self.D
+        
+        mu_eff = self.mu_active(phi_t)
+        if not self.epr_mu_active_only:
+            mu_eff = mu_eff + self._mu_eq(phi_t)
+            
+        return - mu_eff * dphi_dt / self.D
 
     def compute_total_epr(self, phi_t, phi_tp1):
         sigma = self.compute_local_epr_density(phi_t, phi_tp1)
@@ -432,8 +442,8 @@ def main():
     parser.add_argument("--backend", type=str, default="numpy", choices=["numpy", "torch"])
     parser.add_argument("--use_gpu", action="store_true")
     
-    parser.add_argument("--output", type=str, default="amb_1d_trajectories.npz")
-    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--epr_mu_active_only", action="store_true", default=True)
+    parser.add_argument("--epr_mu_active_plus_eq", action="store_false", dest="epr_mu_active_only", help="Use mu_active + mu_eq for EPR")
 
     args = parser.parse_args()
 
@@ -450,7 +460,8 @@ def main():
     model = ActiveModelB1D(
         Lx=args.Lx, dx=args.dx, a=args.a, b=args.b,
         kappa=args.kappa, lam=args.lam, D=args.D, dt=args.dt, smooth=args.smooth,
-        backend=args.backend, use_gpu=args.use_gpu, bc=args.bc
+        backend=args.backend, use_gpu=args.use_gpu, bc=args.bc,
+        epr_mu_active_only=args.epr_mu_active_only
     )
 
     trajectories = model.generate_trajectories(

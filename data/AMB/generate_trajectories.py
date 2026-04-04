@@ -62,6 +62,7 @@ class ActiveModelB:
         use_gpu: bool = False,
         bc: str = "periodic",
         epr_mode: str = "mid",
+        epr_mu_active_only: bool = True,
     ):
         self.Lx = Lx
         self.Ly = Ly
@@ -77,6 +78,7 @@ class ActiveModelB:
         self.use_gpu = use_gpu
         self.bc = bc
         self.epr_mode = epr_mode
+        self.epr_mu_active_only = epr_mu_active_only
 
         # Boundary mode: 'periodic' (default) or 'fixed' (wall)
         self.bc_mode = bc
@@ -258,23 +260,31 @@ class ActiveModelB:
     def compute_local_epr_density(self, phi_t, phi_tp1):
         """
         Local entropy production rate density (2-point).
-        σ(r,t) = - μ_active(mid) · ∂ₜφ / D
-        Uses Stratonovich midpoint for μ_active.
+        σ(r,t) = - μ_active_eff(mid) · ∂ₜφ / D
+        Uses Stratonovich midpoint for μ_active_eff.
         """
         dphi_dt = (phi_tp1 - phi_t) / self.dt
         phi_mid = 0.5 * (phi_t + phi_tp1)
-        mu_act = self.mu_active(phi_mid)
-        return - mu_act * dphi_dt / self.D
+        
+        mu_eff = self.mu_active(phi_mid)
+        if not self.epr_mu_active_only:
+            mu_eff = mu_eff + self._mu_eq(phi_mid)
+            
+        return - mu_eff * dphi_dt / self.D
 
     def compute_local_epr_density_three(self, phi_p, phi_t, phi_n):
         """
         Local entropy production rate density (3-point).
         Uses central difference in time: ∂ₜφ ≈ (φ(t+1) - φ(t-1)) / (2dt)
-        and μ_active evaluated at φ(t).
+        and μ_active_eff evaluated at φ(t).
         """
         dphi_dt = (phi_n - phi_p) / (2 * self.dt)
-        mu_act = self.mu_active(phi_t)
-        return - mu_act * dphi_dt / self.D
+        
+        mu_eff = self.mu_active(phi_t)
+        if not self.epr_mu_active_only:
+            mu_eff = mu_eff + self._mu_eq(phi_t)
+            
+        return - mu_eff * dphi_dt / self.D
 
     def compute_total_epr(self, phi_t, phi_tp1):
         """Spatially-integrated EPR at one time step."""
@@ -611,6 +621,8 @@ def main():
     parser.add_argument("--use_gpu", action="store_true")
     parser.add_argument("--bc", type=str, default="periodic", choices=["periodic", "fixed"])
     parser.add_argument("--epr_mode", type=str, default="mid", choices=["mid", "standard"])
+    parser.add_argument("--epr_mu_active_only", action="store_true", default=True)
+    parser.add_argument("--epr_mu_active_plus_eq", action="store_false", dest="epr_mu_active_only", help="Use mu_active + mu_eq for EPR")
 
     parser.add_argument("--output", type=str, default="amb_trajectories.npz")
     parser.add_argument("--seed", type=int, default=None)
@@ -635,6 +647,7 @@ def main():
         smooth=args.smooth,
         backend=args.backend, use_gpu=args.use_gpu,
         bc=args.bc, epr_mode=args.epr_mode,
+        epr_mu_active_only=args.epr_mu_active_only,
     )
 
     trajectories = model.generate_trajectories(

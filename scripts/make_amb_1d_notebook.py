@@ -36,9 +36,21 @@ for line in src:
     elif 'init_mode =' in line:
         new_src.append('init_mode = "wall"\n')
         new_src.append('init_type = "wall"\n')
+        new_src.append('epr_mu_active_only = True\n')
     else:
         new_src.append(line)
 nb['cells'][2]['source'] = new_src
+
+# cell 3 - AMB parameters
+src = nb['cells'][3]['source']
+new_src = []
+for line in src:
+    if "'bc': \"periodic\"" in line:
+        new_src.append("    'bc': \"periodic\",\n")
+        new_src.append("    'epr_mu_active_only': True\n")
+    else:
+        new_src.append(line)
+nb['cells'][3]['source'] = new_src
 
 # cell 4 - train generation
 src = nb['cells'][4]['source']

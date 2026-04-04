@@ -40,6 +40,8 @@ def main():
     parser.add_argument("--plot_output", type=str, default="amb_1d_mean_epr_density_plot.png")
     parser.add_argument("--epr_kymo_output", type=str, default="amb_1d_ensemble_epr_kymo.png")
     parser.add_argument("--phi_kymo_output", type=str, default="amb_1d_ensemble_phi_kymo.png")
+    parser.add_argument("--epr_mu_active_only", action="store_true", default=True)
+    parser.add_argument("--epr_mu_active_plus_eq", action="store_false", dest="epr_mu_active_only")
 
     args = parser.parse_args()
 
@@ -58,7 +60,8 @@ def main():
     model = ActiveModelB1D(
         Lx=args.Lx, dx=args.dx, a=args.a, b=args.b,
         kappa=args.kappa, lam=args.lam, D=args.D, dt=args.dt, smooth=args.smooth,
-        backend=args.backend, use_gpu=args.use_gpu
+        backend=args.backend, use_gpu=args.use_gpu,
+        epr_mu_active_only=args.epr_mu_active_only
     )
 
     all_eprs = []
