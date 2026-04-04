@@ -4,10 +4,10 @@ import os
 import torch
 import torchvision
 from datetime import datetime
-from utils.sampler import CartesianSampler, CartesianSeqSampler
+from utils.sampler import CartesianSeqSampler
 from models.CNEEP_0 import CNEEP
-from models.train import train
-from models.validate import validate
+from utils.train import train
+from utils.validate import validate
 
 from tqdm import tqdm
 import matplotlib.pyplot as plt

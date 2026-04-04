@@ -1,7 +1,6 @@
 import torch
 import sys, os
 from argparse import Namespace
-import numpy as np
 
 # Add CNEEP_v2 root to path so 'models' and 'utils' can be imported
 sys.path.append(os.getcwd())
@@ -10,8 +9,8 @@ sys.path.append(os.path.join(os.getcwd(), 'data', 'AMB'))
 
 from generate_trajectories_1d import ActiveModelB1D
 from utils.sampler import CartesianSeqSampler
-from models.train_1d import train_1d as train
-from models.validate_1d import validate_1d as validate
+from utils.train_1d import train_1d as train
+from utils.validate_1d import validate_1d as validate
 from models.CNEEP_1D import CNEEP
 from models.UNEEP_1D import CNEEP as UNEEP
 
