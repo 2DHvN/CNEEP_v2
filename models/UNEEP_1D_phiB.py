@@ -125,4 +125,4 @@ class CNEEP(nn.Module):
         x_ = self.H(x_)
         _x = self.H(_x)
 
-        return (x_ + _x) * delta + (x_ - _x) * beta
+        return (x_ + _x) * delta + (x_ - _x) * self.beta
