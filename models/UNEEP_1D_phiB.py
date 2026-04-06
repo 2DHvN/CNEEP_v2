@@ -40,6 +40,7 @@ class CNEEP(nn.Module):
         self.n_layer = opt.n_layer
         self.init_channel = opt.n_channel
         self.positional = opt.positional
+        self.beta = opt.beta
 
         #
         # encoding layer
@@ -124,4 +125,4 @@ class CNEEP(nn.Module):
         x_ = self.H(x_)
         _x = self.H(_x)
 
-        return (x_ + _x) * delta
+        return (x_ + _x) * delta + (x_ - _x) * beta
