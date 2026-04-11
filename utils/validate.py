@@ -11,6 +11,7 @@ def validate(opt, model, trajs, sampler, transform):
     ret = []
     maps = []
     loss = 0
+    n_samples = 0
     with torch.no_grad():
         for batch in sampler:
             b0 = batch[0].to(trajs.device)
@@ -27,7 +28,10 @@ def validate(opt, model, trajs, sampler, transform):
                 loss += (- ent_production + (torch.exp(-ent_production) - 1)).sum().cpu().item()
             else:
                 loss += (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha + (torch.exp(-(1 + opt.alpha) * ent_production) - 1) / (1 + opt.alpha)).sum().cpu().item()
-    loss = loss / sampler.size
+            
+            n_samples += x.shape[0]
+            
+    loss = loss / n_samples
 
 
     ret = np.concatenate(ret)
