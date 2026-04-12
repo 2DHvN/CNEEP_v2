@@ -87,8 +87,9 @@ class CNEEP(nn.Module):
         upsample_factor = 2 ** (opt.n_layer - 1)
 
         decoder = nn.Sequential(
-            nn.Conv1d(bottleneck_channels, 1, kernel_size=1, stride=1, padding=0),
+            nn.Conv1d(bottleneck_channels, opt.n_channel, kernel_size=1, stride=1, padding=0),
             nn.Upsample(scale_factor=upsample_factor, mode='linear', align_corners=True),
+            nn.Conv1d(opt.n_channel, 1, kernel_size=1, stride=1, padding=0),
         )
         setattr(self, f"{prefix}_decoder", decoder)
 
