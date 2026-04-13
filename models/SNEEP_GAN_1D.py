@@ -4,10 +4,14 @@ from utils.add_position import add_x_channel
 
 class SNEEP_Discriminator(nn.Module):
     """
-    Discriminator for System Entropy Production Pattern.
-    Takes a single field state (e.g. phi_t or phi_tp1),
-    and outputs a Local Density Ratio Logit field.
-    The ratio is used to measure log P(phi_t) - log P(phi_tp1).
+    Discriminator for System Entropy Production via Density Ratio Estimation.
+    Takes a single field state phi and outputs a logit field (B, 1, Lx).
+
+    Training setup:
+      - phi_t   (from distribution P_t)     → label 1
+      - phi_tp1 (from distribution P_{t+dt}) → label 0
+
+    At optimality, the logit output approximates log P(phi_t) / P(phi_{t+dt}).
     """
     def __init__(self, opt):
         super(SNEEP_Discriminator, self).__init__()
