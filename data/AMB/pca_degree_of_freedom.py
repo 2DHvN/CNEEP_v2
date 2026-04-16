@@ -23,6 +23,7 @@ import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 import torch
 
@@ -74,6 +75,7 @@ def run_pca_analysis(
     trajectories: np.ndarray,
     n_components: int = None,
     variance_thresholds: list = None,
+    normalize: bool = False,
 ):
     """
     Perform PCA on the AMB snapshot data and return analysis results.
@@ -87,6 +89,10 @@ def run_pca_analysis(
         Number of PCA components to compute.  None → min(n_samples, n_features).
     variance_thresholds : list of float
         E.g. [0.90, 0.95, 0.99].
+    normalize : bool, default False
+        If True, apply StandardScaler (zero-mean + unit-variance) before PCA.
+        This is equivalent to performing PCA on the correlation matrix.
+        If False (default), only centering is applied (covariance matrix PCA).
 
     Returns
     -------
@@ -111,6 +117,11 @@ def run_pca_analysis(
         raise ValueError(f"Unexpected trajectory shape: {trajectories.shape}")
 
     print(f"[PCA] Data matrix shape: {data.shape}")
+    print(f"[PCA] Normalize (StandardScaler): {normalize}")
+
+    if normalize:
+        scaler = StandardScaler()
+        data = scaler.fit_transform(data)
 
     if n_components is None:
         n_components = min(data.shape)
