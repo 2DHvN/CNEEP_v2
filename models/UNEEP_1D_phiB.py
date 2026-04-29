@@ -85,16 +85,32 @@ class CNEEP(nn.Module):
             setattr(self, f"layer{i + 2}", tmp)
 
         #
-        # bootstrapping decoder: single bilinear upsample + conv
+        # bootstrapping decoder: multi-stage upsample + conv with gradual channel reduction
         #
         bottleneck_channels = opt.n_channel * (2 ** (opt.n_layer - 1))
-        upsample_factor = 2 ** (opt.n_layer - 1)
+        
+        layers = []
+        curr_channels = bottleneck_channels
 
-        self.decoder = nn.Sequential(
-            nn.Conv1d(bottleneck_channels, opt.n_channel, kernel_size=1, stride=1, padding=0),
-            nn.Upsample(scale_factor=upsample_factor, mode='linear', align_corners=True),
-            nn.Conv1d(opt.n_channel, 1, kernel_size=1, stride=1, padding=0),
-        )
+        # Multi-stage upsampling with gradual channel reduction
+        for i in range(opt.n_layer - 1):
+            next_channels = opt.n_channel * (2 ** (opt.n_layer - 2 - i))
+            
+            layers.append(nn.Upsample(scale_factor=2, mode='linear', align_corners=True))
+            
+            if opt.periodic:
+                layers.append(PeriodicPad1d(padding=1))
+            else:
+                layers.append(nn.ConstantPad1d(padding=1, value=0))
+                
+            layers.append(nn.Conv1d(curr_channels, next_channels, kernel_size=3))
+            layers.append(nn.ELU(inplace=True))
+            
+            curr_channels = next_channels
+
+        # Final projection to 1 channel
+        layers.append(nn.Conv1d(curr_channels, 1, kernel_size=1))
+        self.decoder = nn.Sequential(*layers)
 
         # initialize parameters
         for m in self.modules():
