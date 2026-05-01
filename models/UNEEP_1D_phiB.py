@@ -34,6 +34,22 @@ class PeriodicPad1d(nn.Module):
 
         return output
 
+class PeriodicUpsample1d(nn.Module):
+    def __init__(self, scale_factor=2):
+        super(PeriodicUpsample1d, self).__init__()
+        self.scale_factor = scale_factor
+
+    def forward(self, x):
+        # x: (B, C, L)
+        L = x.shape[-1]
+        target_len = L * self.scale_factor
+        # Append first element to enable wrap-around interpolation
+        x_padded = torch.cat([x, x[:, :, :1]], dim=-1)  # (B, C, L+1)
+        # Interpolate: align_corners=True ensures output[0]==input[0], output[target_len]==input[0]
+        x_up = F.interpolate(x_padded, size=target_len + 1, mode='linear', align_corners=True)
+        # Drop the last point (duplicate of first)
+        return x_up[:, :, :-1]
+
 class CNEEP(nn.Module):
     def __init__(self, opt):
         super(CNEEP, self).__init__()
@@ -96,7 +112,10 @@ class CNEEP(nn.Module):
         for i in range(opt.n_layer - 1):
             next_channels = opt.n_channel * (2 ** (opt.n_layer - 2 - i))
             
-            layers.append(nn.Upsample(scale_factor=2, mode='linear', align_corners=True))
+            if opt.periodic:
+                layers.append(PeriodicUpsample1d(scale_factor=2))
+            else:
+                layers.append(nn.Upsample(scale_factor=2, mode='linear', align_corners=True))
             
             if opt.periodic:
                 layers.append(PeriodicPad1d(padding=1))
