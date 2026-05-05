@@ -199,15 +199,21 @@ class MultiScaleCNEEP1D(nn.Module):
         return branch(x)
 
     # ----- forward ----- #
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_maps: bool = False) -> torch.Tensor:
         """
         Parameters
         ----------
         x : [B, seq_len, L]
+        return_maps : bool (optional, default False)
+            If True, returns the full local EP maps [B, K, L].
+            If False, returns the scalar EP per distance [B, K].
 
         Returns
         -------
-        J : [B, K]  where J[:, k-1] is the estimated EP at distance k.
+        If return_maps is False:
+            J : [B, K]  where J[:, k-1] is the estimated EP at distance k.
+        If return_maps is True:
+            maps : [B, K, L] where maps[:, k-1, :] is the local EP map at distance k.
         """
         # Time-forward and time-reversed inputs
         x_ = x                          # forward
@@ -222,19 +228,29 @@ class MultiScaleCNEEP1D(nn.Module):
             _x = add_x_channel(_x)
 
         J_list = []
+        map_list = []
 
         for branch in self.branches:
             # Local EP maps from forward / reversed inputs  [B, 1, L]
             map_fwd = self._local_map(x_, branch)
             map_rev = self._local_map(_x, branch)
 
-            local_ep = (map_fwd - map_rev)
+            # Time-reversal antisymmetry at the map level (Req. 6)
+            local_ep = (map_fwd - map_rev)  # [B, 1, L]
 
-            J_k = local_ep.mean(dim=2)          # [B, 1]
-            J_list.append(J_k)
+            if return_maps:
+                map_list.append(local_ep)
+            else:
+                # Global Average Pooling over the spatial dimension (Req. 7)
+                J_k = local_ep.mean(dim=2)          # [B, 1]
+                J_list.append(J_k)
 
-        # Stack into [B, K]
-        return torch.cat(J_list, dim=1)
+        if return_maps:
+            # Stack into [B, K, L]
+            return torch.cat(map_list, dim=1)
+        else:
+            # Stack into [B, K]
+            return torch.cat(J_list, dim=1)
 
 
 # ──────────────────────────────────────────────────────────────
