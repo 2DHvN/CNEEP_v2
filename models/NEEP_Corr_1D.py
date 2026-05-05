@@ -173,7 +173,7 @@ class MultiScaleCNEEP1D(nn.Module):
         hidden_channels = opt.n_channel
         n_hidden = getattr(opt, "n_hidden", 2)
 
-        # Build K independent branches (k = 1 … max_distance)
+        # Build K independent branches (k = 0 … max_distance)
         self.branches = nn.ModuleList([
             _CorrelationBranch(
                 k=k,
@@ -181,7 +181,7 @@ class MultiScaleCNEEP1D(nn.Module):
                 hidden_channels=hidden_channels,
                 n_hidden=n_hidden,
             )
-            for k in range(1, self.max_distance + 1)
+            for k in range(0, self.max_distance + 1)
         ])
 
         # Kaiming init for all Conv1d inside branches
