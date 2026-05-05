@@ -228,13 +228,8 @@ class MultiScaleCNEEP1D(nn.Module):
             map_fwd = self._local_map(x_, branch)
             map_rev = self._local_map(_x, branch)
 
-            # Time-reversal antisymmetry at the map level (Req. 6)
-            #   symmetric  part: (H(x_) + H(_x)) * delta
-            #   antisymmetric  : (H(x_) - H(_x)) * beta
-            local_ep = (map_fwd + map_rev) * delta \
-                     + (map_fwd - map_rev) * self.beta   # [B, 1, L]
+            local_ep = (map_fwd - map_rev)
 
-            # Global Average Pooling over the spatial dimension (Req. 7)
             J_k = local_ep.mean(dim=2)          # [B, 1]
             J_list.append(J_k)
 
