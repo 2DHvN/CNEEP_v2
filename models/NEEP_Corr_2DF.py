@@ -20,13 +20,11 @@ class PeriodicPad2d(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────
-# Masked 2D Convolution  (Requirement 1)
+# Masked 2D Convolution 
 # ──────────────────────────────────────────────────────────────
 class MaskedConv2d(nn.Module):
     """Conv2d whose kernel is masked so that only the center and
     the 4 orthogonal points at Manhattan/grid distance k are learnable.
-
-    For k=0, only the center is learnable.
     """
 
     def __init__(self, in_channels: int, out_channels: int, k: int,
@@ -37,7 +35,6 @@ class MaskedConv2d(nn.Module):
         self.k = k
         self.kernel_size = 2 * k + 1
 
-        # Learnable weight & bias
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels, self.kernel_size, self.kernel_size)
         )
@@ -46,45 +43,63 @@ class MaskedConv2d(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        # Build the binary mask
         mask = torch.zeros(1, 1, self.kernel_size, self.kernel_size)
-        mask[0, 0, k, k] = 1.0  # Center point
+        mask[0, 0, k, k] = 1.0
         if k > 0:
-            # Set the entire border/perimeter to 1.0
-            mask[0, 0, 0, :] = 1.0        # Top edge
-            mask[0, 0, 2 * k, :] = 1.0    # Bottom edge
-            mask[0, 0, :, 0] = 1.0        # Left edge
-            mask[0, 0, :, 2 * k] = 1.0    # Right edge
+            mask[0, 0, 0, :] = 1.0
+            mask[0, 0, 2 * k, :] = 1.0
+            mask[0, 0, :, 0] = 1.0
+            mask[0, 0, :, 2 * k] = 1.0
             
         self.register_buffer("mask", mask)
 
-        # Kaiming initialisation
-        nn.init.kaiming_normal_(self.weight, mode="fan_out",
-                                nonlinearity="relu")
+        nn.init.kaiming_normal_(self.weight, mode="fan_out", nonlinearity="relu")
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x : [B, C_in, Lx, Ly]  (already periodically padded)."""
         return F.conv2d(x, self.weight * self.mask, self.bias,
                         stride=1, padding=0)
 
 
 # ──────────────────────────────────────────────────────────────
-# Single correlation-distance branch
+# Spatial Weighted Sum (Breaks Translation Equivariance)
 # ──────────────────────────────────────────────────────────────
-class _CorrelationBranch2D(nn.Module):
-    """One branch for a specific distance *k*.
+class SpatialWeightedSum2d(nn.Module):
+    """
+    Applies a learnable spatial weight map of shape [1, C, Lx, Ly].
+    This explicitly breaks translation equivariance.
+    """
+    def __init__(self, in_channels: int, Lx: int, Ly: int):
+        super(SpatialWeightedSum2d, self).__init__()
+        self.weight = nn.Parameter(torch.empty(1, in_channels, Lx, Ly))
+        self.bias = nn.Parameter(torch.empty(1, 1, Lx, Ly))
+        
+        # Initialize with small values
+        nn.init.normal_(self.weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.bias)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, Lx, Ly]
+        # output: [B, 1, Lx, Ly]
+        return torch.sum(x * self.weight, dim=1, keepdim=True) + self.bias
+
+
+# ──────────────────────────────────────────────────────────────
+# Single 2DF Branch
+# ──────────────────────────────────────────────────────────────
+class _CorrelationBranch2DF(nn.Module):
+    """
     Pipeline (per branch):
         PeriodicPad2d(k) → MaskedConv2d(kernel=2k+1) → ELU
         → [Conv2d(1×1) → ELU] × (n_hidden - 1)
-        → Conv2d(1×1)  →  Local EP 2D Map  [B, 1, Lx, Ly]
+        → Conv2d(1×1) to reduce_channels → ELU
+        → SpatialWeightedSum2d [B, 1, Lx, Ly]
     """
 
     def __init__(self, k: int, in_channels: int, hidden_channels: int,
-                 n_hidden: int = 2):
-        super(_CorrelationBranch2D, self).__init__()
+                 reduce_channels: int, Lx: int, Ly: int, n_hidden: int = 2):
+        super(_CorrelationBranch2DF, self).__init__()
         self.k = k
 
         layers = []
@@ -98,25 +113,25 @@ class _CorrelationBranch2D(nn.Module):
             layers.append(nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1))
             layers.append(nn.ELU(inplace=True))
 
-        # Output to 1 channel (local EP scalar per position)
-        layers.append(nn.Conv2d(hidden_channels, 1, kernel_size=1))
+        # 1x1 conv to moderately reduce channels before spatial masking
+        layers.append(nn.Conv2d(hidden_channels, reduce_channels, kernel_size=1))
+        layers.append(nn.ELU(inplace=True))
 
         self.net = nn.Sequential(*layers)
+        
+        # Spatial weighted sum (C x W x H)
+        self.spatial_weight = SpatialWeightedSum2d(reduce_channels, Lx, Ly)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x : [B, seq_len, Lx, Ly]"""
-        return self.net(x)
+        features = self.net(x)
+        return self.spatial_weight(features)
 
 
 # ──────────────────────────────────────────────────────────────
-# Spatial channel helper (optional)
+# Spatial channel helper
 # ──────────────────────────────────────────────────────────────
 def add_spatial_channels(x: torch.Tensor) -> torch.Tensor:
-    """
-    x: [B, C, Lx, Ly]
-    Appends normalized x and y coordinate channels.
-    Returns: [B, C+2, Lx, Ly]
-    """
     B, _, Lx, Ly = x.shape
     device = x.device
     
@@ -134,76 +149,61 @@ def add_spatial_channels(x: torch.Tensor) -> torch.Tensor:
 
 
 # ──────────────────────────────────────────────────────────────
-# 2D Multi-Scale CNEEP Model
+# 2D Multi-Scale CNEEP 2DF Model
 # ──────────────────────────────────────────────────────────────
-class MultiScaleCNEEP2D(nn.Module):
+class MultiScaleCNEEP_2DF(nn.Module):
     """
-    Parallel branch architecture for 2D spatial entropy production estimation.
-    Extracts EP contributions separated by correlation distance.
+    Parallel branch architecture with Spatial Masking (2DF) for 2D.
+    Breaks translation equivariance via location-specific weights.
     """
 
     def __init__(self, opt):
-        super(MultiScaleCNEEP2D, self).__init__()
+        super(MultiScaleCNEEP_2DF, self).__init__()
 
-        self.positional = opt.positional
-        self.beta = opt.beta
+        self.positional = getattr(opt, "positional", False)
+        self.beta = getattr(opt, "beta", 1.0)
         self.max_distance = opt.max_distance
+        
+        # Extract spatial dimensions from opt.input_shape
+        if not hasattr(opt, "input_shape"):
+            raise ValueError("opt.input_shape (e.g., (64, 64)) is required for XDF models to define the spatial mask.")
+        Lx, Ly = opt.input_shape
 
-        in_channels = opt.seq_len + (2 if opt.positional else 0)
+        in_channels = opt.seq_len + (2 if self.positional else 0)
         hidden_channels = opt.n_channel
         n_hidden = getattr(opt, "n_hidden", 2)
+        reduce_channels = getattr(opt, "reduce_channel", 4) # Default to 4 if not specified
 
         self.include_k0 = getattr(opt, "include_k0", True)
         start_k = 0 if self.include_k0 else 1
-        # Build K independent branches (k = start_k … max_distance)
+
         self.branches = nn.ModuleList([
-            _CorrelationBranch2D(
+            _CorrelationBranch2DF(
                 k=k,
                 in_channels=in_channels,
                 hidden_channels=hidden_channels,
+                reduce_channels=reduce_channels,
+                Lx=Lx, Ly=Ly,
                 n_hidden=n_hidden,
             )
             for k in range(start_k, self.max_distance + 1)
         ])
 
-        # Kaiming init for all Conv2d inside branches
+        # Kaiming init for standard layers
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    # ----- shared backbone: produces the local EP map ----- #
     def _local_map(self, x: torch.Tensor,
-                   branch: _CorrelationBranch2D) -> torch.Tensor:
-        """Run one branch on input *x* and return [B, 1, Lx, Ly] local EP map."""
+                   branch: _CorrelationBranch2DF) -> torch.Tensor:
         return branch(x)
 
-    # ----- forward ----- #
     def forward(self, x: torch.Tensor, return_maps: bool = False) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x : [B, seq_len, Lx, Ly]
-        return_maps : bool (optional, default False)
-            If True, returns the full local EP maps [B, K, Lx, Ly].
-            If False, returns the scalar EP per distance [B, K].
+        x_ = x
+        _x = torch.flip(x, [1])
 
-        Returns
-        -------
-        If return_maps is False:
-            J : [B, K+1]  where J[:, k] is the estimated EP at distance k.
-        If return_maps is True:
-            maps : [B, K+1, Lx, Ly] where maps[:, k, :, :] is the local EP map at distance k.
-        """
-        # Time-forward and time-reversed inputs
-        x_ = x                          # forward
-        _x = torch.flip(x, [1])         # reverse time dimension
-
-        # Δφ (state difference used for the symmetric term)
-        delta = (x[:, 0, :, :] - x[:, 1, :, :]).unsqueeze(1)  # [B, 1, Lx, Ly]
-
-        # Optionally append positional channels
         if self.positional:
             x_ = add_spatial_channels(x_)
             _x = add_spatial_channels(_x)
@@ -212,23 +212,18 @@ class MultiScaleCNEEP2D(nn.Module):
         map_list = []
 
         for branch in self.branches:
-            # Local EP maps from forward / reversed inputs  [B, 1, Lx, Ly]
             map_fwd = self._local_map(x_, branch)
             map_rev = self._local_map(_x, branch)
 
-            # Time-reversal antisymmetry at the map level
-            local_ep = (map_fwd - map_rev)   # [B, 1, Lx, Ly]
+            local_ep = (map_fwd - map_rev)
 
             if return_maps:
                 map_list.append(local_ep)
             else:
-                # Global Average Pooling over the spatial dimensions
-                J_k = local_ep.mean(dim=(2, 3))          # [B, 1]
+                J_k = local_ep.mean(dim=(2, 3))
                 J_list.append(J_k)
 
         if return_maps:
-            # Stack into [B, K+1, Lx, Ly]
             return torch.cat(map_list, dim=1)
         else:
-            # Stack into [B, K+1]
             return torch.cat(J_list, dim=1)
