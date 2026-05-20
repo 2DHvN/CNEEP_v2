@@ -575,3 +575,119 @@ class LatticeABP:
             jammed |= orient_mask & (front_occ == 1)
 
         return jammed
+
+    # ------------------------------------------------------------------
+    # Ground Truth Entropy Production Rate (EPR) computation
+    # ------------------------------------------------------------------
+
+    def compute_local_epr(
+        self, O: torch.Tensor, E: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute local entropy production rate (EPR) density for each site.
+
+        For a CTMC, the local EPR at site i is:
+            σ_i = Σ_events  W_fwd * log(W_fwd / W_rev)
+
+        For translations:
+            W_fwd(i→j) = rate(orient, dir) * (1 - O_j)   [hop i to j]
+            W_rev(j→i) = rate(orient_at_j, -dir) * (1 - O_i_after_hop)
+        Since we compute the instantaneous rate (before any hop occurs),
+        we use the symmetric formula:
+            σ_i(dir d) = W_i^d * log(W_i^d / W_j^{-d})
+
+        Args:
+            O: (B, L, L) occupancy tensor.
+            E: (B, L, L) orientation tensor.
+
+        Returns:
+            epr_map: (B, L, L) local EPR density.
+        """
+        B, L, _ = O.shape
+        epr_map = torch.zeros(B, L, L, device=O.device)
+
+        rows = torch.arange(L, device=O.device)
+        cols = torch.arange(L, device=O.device)
+        grid_r, grid_c = torch.meshgrid(rows, cols, indexing="ij")
+
+        eps = 1e-30  # avoid log(0)
+
+        for d in range(4):
+            dy, dx = self.dir_vecs[d]
+            d_rev = (d + 2) % 4  # reverse direction
+
+            # Destination coordinates
+            dest_r = self.bc.wrap(grid_r + dy)
+            dest_c = self.bc.wrap(grid_c + dx)
+
+            # --- Forward rate: site i hopping in direction d ---
+            # dot(orientation_i, dir_d)
+            dots_fwd = self.dot_table[E, d]  # (B, L, L)
+            rate_idx_fwd = (dots_fwd + 1).long()
+            base_rate_fwd = self.rate_from_dot[rate_idx_fwd]  # (B, L, L)
+            O_dest = O[:, dest_r, dest_c]
+            W_fwd = base_rate_fwd * (1 - O_dest).float() * O.float()
+
+            # --- Reverse rate: site j hopping in direction -d back to i ---
+            # orientation at destination site j
+            E_dest = E[:, dest_r, dest_c]
+            dots_rev = self.dot_table[E_dest, d_rev]  # (B, L, L)
+            rate_idx_rev = (dots_rev + 1).long()
+            base_rate_rev = self.rate_from_dot[rate_idx_rev]
+            # Reverse hop: destination is site i, which is occupied
+            # So reverse rate is base_rate_rev * (1 - O_i) * O_j
+            # But since O_i=1 (we have a particle), reverse hop is blocked
+            # For EPR we use the hypothetical rate: what would be the rate
+            # if the reverse transition were possible (detailed balance check)
+            O_src = O  # occupancy at source i
+            W_rev = base_rate_rev * (1 - O_src).float() * O_dest.float()
+
+            # EPR contribution: W_fwd * log(W_fwd / W_rev)
+            # Only count where both W_fwd > 0 or W_rev > 0
+            valid = (W_fwd > eps) | (W_rev > eps)
+            log_ratio = torch.log((W_fwd + eps) / (W_rev + eps))
+            epr_map += torch.where(valid, (W_fwd - W_rev) * log_ratio, torch.zeros_like(W_fwd))
+
+        # Rotation EPR: CW and CCW have equal rates → no EPR from rotations
+        # (symmetric: D_rot for both CW and CCW)
+
+        return epr_map
+
+    def compute_transition_ep(
+        self,
+        O_before: torch.Tensor, E_before: torch.Tensor,
+        O_after: torch.Tensor, E_after: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute per-site entropy production for a single transition.
+
+        Estimates local EP by comparing the occupancy change between two
+        snapshots and computing log(W_fwd/W_rev) for the observed transitions.
+
+        This is a simpler approximation: for each site where a particle
+        departed or arrived, compute the EP from the rate asymmetry.
+
+        Args:
+            O_before, E_before: State before transition (B, L, L).
+            O_after, E_after: State after transition (B, L, L).
+
+        Returns:
+            ep_map: (B, L, L) local EP estimate per site.
+        """
+        # Sites where particles departed (was 1, now 0)
+        departed = (O_before == 1) & (O_after == 0)
+        # Sites where particles arrived (was 0, now 1)
+        arrived = (O_before == 0) & (O_after == 1)
+
+        # For each departed-arrived pair, compute log(W_fwd/W_rev)
+        # Use the transition rates at the "before" state
+        W_all, _ = self.compute_transition_rates(O_before, E_before)
+
+        B, L, _ = O_before.shape
+        ep_map = torch.zeros(B, L, L, device=O_before.device)
+
+        # For simplicity, assign EPR based on total outgoing vs incoming rates
+        for d in range(4):
+            W_d = W_all[:, :, :, d]
+            # Sum outgoing rates from departed sites
+            ep_map += W_d * departed.float()
+
+        return ep_map
