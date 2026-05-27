@@ -169,7 +169,8 @@ class MultiScaleCNEEP_2DF(nn.Module):
             raise ValueError("opt.input_shape (e.g., (64, 64)) is required for XDF models to define the spatial mask.")
         Lx, Ly = opt.input_shape
 
-        in_channels = opt.seq_len + (2 if self.positional else 0)
+        self.n_components = getattr(opt, "n_components", 1)
+        in_channels = opt.seq_len * self.n_components + (2 if self.positional else 0)
         hidden_channels = opt.n_channel
         n_hidden = getattr(opt, "n_hidden", 2)
         reduce_channels = getattr(opt, "reduce_channel", 4) # Default to 4 if not specified
@@ -201,8 +202,13 @@ class MultiScaleCNEEP_2DF(nn.Module):
         return branch(x)
 
     def forward(self, x: torch.Tensor, return_maps: bool = False) -> torch.Tensor:
-        x_ = x
-        _x = torch.flip(x, [1])
+        if self.n_components > 1:
+            B, S, C, Lx, Ly = x.shape
+            x_ = x.reshape(B, S * C, Lx, Ly)
+            _x = torch.flip(x, [1]).reshape(B, S * C, Lx, Ly)
+        else:
+            x_ = x
+            _x = torch.flip(x, [1])
 
         if self.positional:
             x_ = add_spatial_channels(x_)
