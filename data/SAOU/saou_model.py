@@ -222,6 +222,10 @@ def build_shell_ops(L: int, shells: Sequence[Shell]) -> List[ShellOps]:
 
 def shell_convolution_fft(field: torch.Tensor, op: ShellOps) -> torch.Tensor:
     """Compute sum_delta w_delta field[i+delta] with periodic boundaries."""
+    if op.kernel_hat_t is None:
+        op.kernel_hat_t = torch.from_numpy(op.kernel_hat).to(field.device)
+    elif op.kernel_hat_t.device != field.device:
+        op.kernel_hat_t = op.kernel_hat_t.to(field.device)
     kernel = op.kernel_hat_t
     if kernel.dim() < field.dim() - 1:
         kernel = kernel.unsqueeze(0)
