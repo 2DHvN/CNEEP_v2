@@ -65,7 +65,7 @@ import numpy as np
 import torch
 
 try:
-    from tqdm.auto import trange
+    from tqdm import trange
 except ImportError:
     trange = range
 
