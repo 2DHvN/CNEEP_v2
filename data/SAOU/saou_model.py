@@ -62,9 +62,10 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import torch
 
 try:
-    from tqdm import trange
+    from tqdm.auto import trange
 except ImportError:
     trange = range
 
@@ -100,15 +101,16 @@ class ShellOps:
 
     shell: Shell
     kernel_hat: np.ndarray  # rfftn of circular kernel
+    kernel_hat_t: Optional[torch.Tensor] = None  # PyTorch tensor version
 
 
 # ======================================================================
 # Rotation and weight helpers
 # ======================================================================
 
-def rotate90(x: np.ndarray) -> np.ndarray:
+def rotate90(x: torch.Tensor) -> torch.Tensor:
     """Apply R=[[0,-1],[1,0]] to the last dimension of x."""
-    return np.stack((-x[..., 1], x[..., 0]), axis=-1)
+    return torch.stack((-x[..., 1], x[..., 0]), dim=-1)
 
 
 def _normalize_weights(weights: np.ndarray, mode: str) -> np.ndarray:
@@ -218,12 +220,15 @@ def build_shell_ops(L: int, shells: Sequence[Shell]) -> List[ShellOps]:
     return ops
 
 
-def shell_convolution_fft(field: np.ndarray, op: ShellOps) -> np.ndarray:
+def shell_convolution_fft(field: torch.Tensor, op: ShellOps) -> torch.Tensor:
     """Compute sum_delta w_delta field[i+delta] with periodic boundaries."""
-    return np.fft.irfftn(
-        np.fft.rfftn(field, axes=(0, 1)) * op.kernel_hat,
-        s=field.shape,
-        axes=(0, 1),
+    kernel = op.kernel_hat_t
+    if kernel.dim() < field.dim() - 1:
+        kernel = kernel.unsqueeze(0)
+    return torch.fft.irfftn(
+        torch.fft.rfftn(field, dim=(-2, -1)) * kernel,
+        s=field.shape[-2:],
+        dim=(-2, -1),
     ).real
 
 
@@ -272,16 +277,16 @@ def kernel_inner(q1: Dict[Offset, float], q2: Dict[Offset, float]) -> float:
 # Velocity fields
 # ======================================================================
 
-def local_torque_velocity(x: np.ndarray, omega0: float) -> np.ndarray:
+def local_torque_velocity(x: torch.Tensor, omega0: float) -> torch.Tensor:
     """Compute omega0 R X_i."""
     if omega0 == 0.0:
-        return np.zeros_like(x, dtype=np.float64)
+        return torch.zeros_like(x)
     return float(omega0) * rotate90(x)
 
 
-def relative_displacement_by_shell(x: np.ndarray, op: ShellOps) -> np.ndarray:
+def relative_displacement_by_shell(x: torch.Tensor, op: ShellOps) -> torch.Tensor:
     """
-    Compute sum_delta w_delta (X_{i+delta} - X_i); x shape (L,L,2).
+    Compute sum_delta w_delta (X_{i+delta} - X_i); x shape (..., L,L,2).
 
     With weight_normalization="mean", this is shell_average(X)_i - X_i.
     """
@@ -291,13 +296,13 @@ def relative_displacement_by_shell(x: np.ndarray, op: ShellOps) -> np.ndarray:
     conv_u = shell_convolution_fft(x[..., 0], op)
     conv_v = shell_convolution_fft(x[..., 1], op)
 
-    out = np.empty_like(x, dtype=np.float64)
+    out = torch.empty_like(x)
     out[..., 0] = conv_u - c * x[..., 0]
     out[..., 1] = conv_v - c * x[..., 1]
     return out
 
 
-def antisymmetric_velocity_by_shell(x: np.ndarray, op: ShellOps) -> np.ndarray:
+def antisymmetric_velocity_by_shell(x: torch.Tensor, op: ShellOps) -> torch.Tensor:
     """
     Compute the relative shell irreversible velocity
 
@@ -308,17 +313,17 @@ def antisymmetric_velocity_by_shell(x: np.ndarray, op: ShellOps) -> np.ndarray:
     sh = op.shell
 
     if sh.amplitude == 0.0:
-        return np.zeros_like(x, dtype=np.float64)
+        return torch.zeros_like(x)
 
     diff = relative_displacement_by_shell(x, op)
     return float(sh.amplitude) * rotate90(diff)
 
 
 def irreversible_velocity_total(
-    x: np.ndarray,
+    x: torch.Tensor,
     ops: Sequence[ShellOps],
     omega0: float = 0.0,
-) -> np.ndarray:
+) -> torch.Tensor:
     """Compute omega0 R X_i + sum_s a_s sum_delta w_delta R(X_{i+delta}-X_i)."""
     v = local_torque_velocity(x, omega0)
 
@@ -330,11 +335,11 @@ def irreversible_velocity_total(
 
 
 def drift(
-    x: np.ndarray,
+    x: torch.Tensor,
     ops: Sequence[ShellOps],
     gamma: float,
     omega0: float = 0.0,
-) -> np.ndarray:
+) -> torch.Tensor:
     """
     Full drift:
         -gamma X + omega0 R X + sum_s a_s sum_delta w_delta R(X_{i+delta}-X_i).
@@ -446,8 +451,8 @@ def theoretical_total_epr(L: int, shells: Sequence[Shell], gamma: float, omega0:
 # ======================================================================
 
 def pathwise_local_epr_increment(
-    x0: np.ndarray,
-    x1: np.ndarray,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
     omega0: float,
     T: float,
 ) -> float:
@@ -463,12 +468,13 @@ def pathwise_local_epr_increment(
     x_mid = 0.5 * (x0 + x1)
     dx = x1 - x0
     vel = local_torque_velocity(x_mid, omega0)
-    return float(np.sum(vel * dx) / T)
+    inc = (vel * dx).sum(dim=(-3, -2, -1)) / T
+    return float(inc.mean().item())
 
 
 def pathwise_shell_epr_increment(
-    x0: np.ndarray,
-    x1: np.ndarray,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
     ops: Sequence[ShellOps],
     T: float,
 ) -> np.ndarray:
@@ -483,17 +489,18 @@ def pathwise_shell_epr_increment(
     x_mid = 0.5 * (x0 + x1)
     dx = x1 - x0
 
-    inc = []
+    inc_list = []
     for op in ops:
         vel_s = antisymmetric_velocity_by_shell(x_mid, op)
-        inc.append(float(np.sum(vel_s * dx) / T))
+        val = (vel_s * dx).sum(dim=(-3, -2, -1)) / T
+        inc_list.append(float(val.mean().item()))
 
-    return np.asarray(inc, dtype=np.float64)
+    return np.asarray(inc_list, dtype=np.float64)
 
 
 def pathwise_total_epr_increment(
-    x0: np.ndarray,
-    x1: np.ndarray,
+    x0: torch.Tensor,
+    x1: torch.Tensor,
     ops: Sequence[ShellOps],
     omega0: float,
     T: float,
@@ -502,7 +509,8 @@ def pathwise_total_epr_increment(
     x_mid = 0.5 * (x0 + x1)
     dx = x1 - x0
     vel = irreversible_velocity_total(x_mid, ops, omega0=omega0)
-    return float(np.sum(vel * dx) / T)
+    inc = (vel * dx).sum(dim=(-3, -2, -1)) / T
+    return float(inc.mean().item())
 
 
 # ======================================================================
@@ -512,6 +520,8 @@ def pathwise_total_epr_increment(
 def simulate(
     *,
     L: int = 32,
+    M: int = 1,
+    device: Optional[str] = None,
     radii: Sequence[float] = (1, 2, 4, 8),
     amplitudes: Sequence[float] = (0.0, 0.0, 0.6, 0.0),
     gamma: float = 1.0,
@@ -534,6 +544,10 @@ def simulate(
     ----------
     L:
         Linear lattice size.
+    M:
+        Number of ensemble trajectories to simulate simultaneously.
+    device:
+        PyTorch device to use. If None, uses "cuda" if available else "cpu".
     radii:
         Upper radii of annular shells.
     amplitudes:
@@ -556,7 +570,7 @@ def simulate(
         "mean" makes each shell term compare X_i with the shell average.
         "none" leaves raw unit weights.
     x0:
-        Optional initial condition of shape (L,L,2).
+        Optional initial condition of shape (L,L,2) or (M,L,L,2).
     show_progress:
         If True, show tqdm progress bars.
     """
@@ -573,28 +587,45 @@ def simulate(
     if sample_every <= 0:
         raise ValueError("sample_every must be positive.")
 
-    rng = np.random.default_rng(seed)
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch_device = torch.device(device)
+
+    torch.manual_seed(seed)
+    
     shells = make_annular_shells(
         radii,
         amplitudes,
         weight_normalization=weight_normalization,
     )
     ops = build_shell_ops(L, shells)
+    
+    for op in ops:
+        op.kernel_hat_t = torch.from_numpy(op.kernel_hat).to(device=torch_device, dtype=torch.complex128)
 
+    was_x0_squeezed = False
     if x0 is None:
         # Exact stationary marginal distribution for symmetric relative antisymmetric OU model.
-        x = rng.normal(loc=0.0, scale=np.sqrt(T / gamma), size=(L, L, 2))
+        x = torch.normal(mean=0.0, std=np.sqrt(T / gamma), size=(M, L, L, 2), device=torch_device, dtype=torch.float64)
     else:
-        x = np.asarray(x0, dtype=np.float64).copy()
-        if x.shape != (L, L, 2):
-            raise ValueError(f"x0 must have shape {(L, L, 2)}, got {x.shape}.")
+        x0_arr = np.asarray(x0, dtype=np.float64).copy()
+        if x0_arr.shape == (L, L, 2):
+            was_x0_squeezed = True
+            if M > 1:
+                x0_arr = np.broadcast_to(x0_arr, (M, L, L, 2)).copy()
+            else:
+                x0_arr = x0_arr[np.newaxis, ...]
+        elif x0_arr.shape != (M, L, L, 2):
+            raise ValueError(f"x0 must have shape {(L, L, 2)} or {(M, L, L, 2)}, got {x0_arr.shape}.")
+        x = torch.from_numpy(x0_arr).to(device=torch_device, dtype=torch.float64)
 
     noise_scale = np.sqrt(2.0 * T * dt)
 
     # Burn-in
     burn_iter = trange(burn_steps, desc="Burn-in", leave=False) if show_progress else range(burn_steps)
     for _ in burn_iter:
-        x = x + drift(x, ops, gamma, omega0=omega0) * dt + noise_scale * rng.normal(size=x.shape)
+        noise = torch.randn_like(x) * noise_scale
+        x = x + drift(x, ops, gamma, omega0=omega0) * dt + noise
 
     # Production
     samples: List[np.ndarray] = []
@@ -607,12 +638,9 @@ def simulate(
 
     prod_iter = trange(n_steps, desc="Simulating", leave=False) if show_progress else range(n_steps)
     for step in prod_iter:
-        x_before = x.copy()
-        x_after = (
-            x_before
-            + drift(x_before, ops, gamma, omega0=omega0) * dt
-            + noise_scale * rng.normal(size=x_before.shape)
-        )
+        x_before = x.clone()
+        noise = torch.randn_like(x_before) * noise_scale
+        x_after = x_before + drift(x_before, ops, gamma, omega0=omega0) * dt + noise
 
         inc_local = pathwise_local_epr_increment(x_before, x_after, omega0, T)
         inc_shell = pathwise_shell_epr_increment(x_before, x_after, ops, T)
@@ -625,7 +653,10 @@ def simulate(
         x = x_after
 
         if record_trajectory and (step % sample_every == 0):
-            samples.append(x.copy())
+            samp = x.cpu().numpy()
+            if M == 1 and (was_x0_squeezed or x0 is None):
+                samp = samp[0]
+            samples.append(samp)
             sample_steps.append(step + 1)
             sample_times.append((step + 1) * dt)
 
@@ -634,13 +665,13 @@ def simulate(
     epr_inc_total_arr = np.asarray(epr_inc_total, dtype=np.float64)
 
     epr_rate_est_local = float(epr_inc_local_arr.mean() / dt)
-    epr_rate_sem_local = float(epr_inc_local_arr.std(ddof=1) / np.sqrt(n_steps) / dt)
+    epr_rate_sem_local = float(epr_inc_local_arr.std(ddof=1) / np.sqrt(n_steps * M) / dt)
 
     epr_rate_est_shell = epr_inc_shell_arr.mean(axis=0) / dt
-    epr_rate_sem_shell = epr_inc_shell_arr.std(axis=0, ddof=1) / np.sqrt(n_steps) / dt
+    epr_rate_sem_shell = epr_inc_shell_arr.std(axis=0, ddof=1) / np.sqrt(n_steps * M) / dt
 
     epr_rate_est_total = float(epr_inc_total_arr.mean() / dt)
-    epr_rate_sem_total = float(epr_inc_total_arr.std(ddof=1) / np.sqrt(n_steps) / dt)
+    epr_rate_sem_total = float(epr_inc_total_arr.std(ddof=1) / np.sqrt(n_steps * M) / dt)
 
     epr_theory_gram = theoretical_epr_gram(L, shells, gamma, omega0)
     epr_theory_self_components = np.diag(epr_theory_gram).copy()
@@ -674,6 +705,8 @@ def simulate(
 
         "params": {
             "L": L,
+            "M": M,
+            "device": device,
             "radii": tuple(radii),
             "amplitudes": tuple(amplitudes),
             "gamma": gamma,
