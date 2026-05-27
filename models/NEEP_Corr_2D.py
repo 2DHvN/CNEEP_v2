@@ -149,7 +149,8 @@ class MultiScaleCNEEP2D(nn.Module):
         self.beta = opt.beta
         self.max_distance = opt.max_distance
 
-        in_channels = opt.seq_len + (2 if opt.positional else 0)
+        self.n_components = getattr(opt, "n_components", 1)
+        in_channels = opt.seq_len * self.n_components + (2 if opt.positional else 0)
         hidden_channels = opt.n_channel
         n_hidden = getattr(opt, "n_hidden", 2)
 
@@ -184,7 +185,8 @@ class MultiScaleCNEEP2D(nn.Module):
         """
         Parameters
         ----------
-        x : [B, seq_len, Lx, Ly]
+        x : If n_components == 1: [B, seq_len, Lx, Ly]
+            If n_components > 1: [B, seq_len, n_components, Lx, Ly]
         return_maps : bool (optional, default False)
             If True, returns the full local EP maps [B, K, Lx, Ly].
             If False, returns the scalar EP per distance [B, K].
@@ -196,9 +198,15 @@ class MultiScaleCNEEP2D(nn.Module):
         If return_maps is True:
             maps : [B, K+1, Lx, Ly] where maps[:, k, :, :] is the local EP map at distance k.
         """
-        # Time-forward and time-reversed inputs
-        x_ = x                          # forward
-        _x = torch.flip(x, [1])         # reverse time dimension
+        if self.n_components > 1:
+            # x is [B, seq_len, C, Lx, Ly]
+            B, S, C, Lx, Ly = x.shape
+            x_ = x.reshape(B, S * C, Lx, Ly)
+            _x = torch.flip(x, [1]).reshape(B, S * C, Lx, Ly)
+        else:
+            # Time-forward and time-reversed inputs
+            x_ = x                          # forward
+            _x = torch.flip(x, [1])         # reverse time dimension
 
         # Δφ (state difference used for the symmetric term)
         delta = (x[:, 0, :, :] - x[:, 1, :, :]).unsqueeze(1)  # [B, 1, Lx, Ly]
