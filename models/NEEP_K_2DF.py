@@ -152,7 +152,7 @@ class MultiScaleK_2DF(nn.Module):
     """
 
     def __init__(self, opt):
-        super(MultiScaleK_2D, self).__init__()
+        super(MultiScaleK_2DF, self).__init__()
 
         self.positional = opt.positional
         self.beta = opt.beta
