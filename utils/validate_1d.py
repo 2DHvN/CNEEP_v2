@@ -20,7 +20,9 @@ def validate_1d(opt, model, trajs, sampler, transform):
             x = transform(torch.cat(slices, dim=1).float().to(opt.device))
 
             ent_map = model(x) / opt.scalar
-            ent_production = torch.mean(ent_map.reshape(x.shape[0], -1), dim = 1)
+            dx = getattr(opt, 'dx', 1.0)
+            vol = x.shape[2] * dx
+            ent_production = torch.mean(ent_map.reshape(x.shape[0], -1), dim=1) * vol
             entropy = ent_production.cpu().squeeze().numpy()
             ret.append(entropy)
             maps.append(ent_map.cpu().squeeze().numpy())

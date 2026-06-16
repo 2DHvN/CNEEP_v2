@@ -17,7 +17,9 @@ def train(opt, model, optim, trajs, sampler, transform):
     # core variables
     delta = delta.reshape(x.shape[0], 1, x.shape[2], x.shape[3])
     mapp = model(x) / opt.scalar
-    ent_production = torch.mean(mapp.reshape(x.shape[0], -1), dim=1)
+    dx = getattr(opt, 'dx', 1.0)
+    vol = x.shape[2] * x.shape[3] * (dx ** 2)
+    ent_production = torch.mean(mapp.reshape(x.shape[0], -1), dim=1) * vol
 
     # regularization term
     R = opt.lam * torch.mean(
