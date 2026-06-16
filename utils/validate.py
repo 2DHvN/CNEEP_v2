@@ -21,15 +21,16 @@ def validate(opt, model, trajs, sampler, transform):
             ent_map = model(x) / opt.scalar
             dx = getattr(opt, 'dx', 1.0)
             vol = x.shape[2] * x.shape[3] * (dx ** 2)
-            ent_production = torch.mean(ent_map.reshape(x.shape[0], -1), dim=1) * vol
+            ep_density = torch.mean(ent_map.reshape(x.shape[0], -1), dim=1)
+            ent_production = ep_density * vol
             entropy = ent_production.cpu().squeeze().numpy()
             ret.append(entropy)
             maps.append(ent_map.cpu().squeeze().numpy())
 
             if opt.alpha == 0:
-                loss += (- ent_production + (torch.exp(-ent_production) - 1)).sum().cpu().item()
+                loss += (- ep_density + (torch.exp(-ep_density) - 1)).sum().cpu().item()
             else:
-                loss += (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha + (torch.exp(-(1 + opt.alpha) * ent_production) - 1) / (1 + opt.alpha)).sum().cpu().item()
+                loss += (- (torch.exp(opt.alpha * ep_density) - 1) / opt.alpha + (torch.exp(-(1 + opt.alpha) * ep_density) - 1) / (1 + opt.alpha)).sum().cpu().item()
             
             n_samples += x.shape[0]
             

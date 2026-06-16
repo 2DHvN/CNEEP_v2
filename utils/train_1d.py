@@ -22,7 +22,8 @@ def train_1d(opt, model, optim, trajs, sampler, transform):
     mapp = model(x) / opt.scalar
     dx = getattr(opt, 'dx', 1.0)
     vol = x.shape[2] * dx
-    ent_production = torch.mean(mapp.reshape(x.shape[0], -1), dim=1) * vol
+    ep_density = torch.mean(mapp.reshape(x.shape[0], -1), dim=1)
+    ent_production = ep_density * vol
 
     # regularization term
     R = opt.lam * torch.mean(
@@ -33,10 +34,10 @@ def train_1d(opt, model, optim, trajs, sampler, transform):
 
     # alpha-NEEP loss
     if opt.alpha == 0:
-        loss = (- ent_production + (torch.exp(-ent_production) - 1)).mean()
+        loss = (- ep_density + (torch.exp(-ep_density) - 1)).mean()
     else:
-        loss = (- (torch.exp(opt.alpha * ent_production) - 1) / opt.alpha
-            + (torch.exp(-(1 + opt.alpha) * ent_production) - 1) / (1 + opt.alpha)).mean()
+        loss = (- (torch.exp(opt.alpha * ep_density) - 1) / opt.alpha
+            + (torch.exp(-(1 + opt.alpha) * ep_density) - 1) / (1 + opt.alpha)).mean()
 
     (loss * opt.loss_scalar + R).backward()
 
