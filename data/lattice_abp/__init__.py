@@ -11,4 +11,11 @@ Modules:
 """
 
 from .core import LatticeABP, BoundaryCondition, InteractionModule
+from .mips_analysis import (
+    coarse_density_periodic,
+    largest_cluster_fraction,
+    low_k_structure_ratio,
+    mips_pass,
+    summarize_mips_snapshot,
+)
 from .visualization import visualize_state, visualize_density_evolution, visualize_jammed_fraction

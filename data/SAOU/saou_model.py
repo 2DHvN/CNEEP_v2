@@ -138,11 +138,15 @@ def make_annular_shells(
     weight_normalization: str = "mean",
 ) -> List[Shell]:
     """
-    Build non-overlapping annular lattice shells.
+    Build non-overlapping Chebyshev (L∞) square lattice shells.
+
+    Uses Chebyshev distance d = max(|dy|, |dx|) to match the K_2DF
+    ExclusiveMaskedConv2d border geometry.  Each shell k contains
+    exactly the perimeter of the (2k+1)×(2k+1) square kernel.
 
     radii defines upper bounds [R1, R2, ...].
 
-    shell 0 contains 0 < r <= R1.
+    shell 0 contains 0 < d_cheb <= R1.
 
     For the relative interaction sum_delta w_delta (X_{i+delta}-X_i),
     weight_normalization="mean" is usually the most physical choice because
@@ -170,7 +174,8 @@ def make_annular_shells(
 
         for dy in range(-rmax, rmax + 1):
             for dx in range(-rmax, rmax + 1):
-                r = float(np.hypot(dy, dx))
+                # Chebyshev (L∞) distance — matches K_2DF square border
+                r = float(max(abs(dy), abs(dx)))
 
                 inside = lower < r <= upper
                 if inside:
@@ -184,7 +189,7 @@ def make_annular_shells(
 
         shells.append(
             Shell(
-                name=f"S{k}_r({lower:g},{upper:g}]",
+                name=f"S{k}_k({lower:g},{upper:g}]",
                 offsets=tuple(offsets),
                 weights=weights,
                 amplitude=float(amp),
@@ -267,6 +272,18 @@ def relative_shell_kernel_dict(sh: Shell) -> Dict[Offset, float]:
     for delta, w in zip(sh.offsets, sh.weights):
         q[delta] = q.get(delta, 0.0) + float(w)
     q[(0, 0)] = q.get((0, 0), 0.0) - shell_weight_sum(sh)
+    return {delta: val for delta, val in q.items() if abs(val) > 1e-15}
+
+
+def absolute_shell_kernel_dict(sh: Shell) -> Dict[Offset, float]:
+    """
+    Return the scalar kernel k_s for K_s X_i = sum_delta w_s(delta) X_{i+delta}.
+
+    This is the absolute shell basis before subtracting c_s X_i.
+    """
+    q: Dict[Offset, float] = {}
+    for delta, w in zip(sh.offsets, sh.weights):
+        q[delta] = q.get(delta, 0.0) + float(w)
     return {delta: val for delta, val in q.items() if abs(val) > 1e-15}
 
 
@@ -381,6 +398,44 @@ def theoretical_epr_gram(
     coeffs = [float(omega0)] + [float(sh.amplitude) for sh in shells]
     kernels: List[Dict[Offset, float]] = [{(0, 0): 1.0}]
     kernels.extend(relative_shell_kernel_dict(sh) for sh in shells)
+
+    n_comp = len(coeffs)
+    gram = np.zeros((n_comp, n_comp), dtype=np.float64)
+    prefactor = 2.0 * N / gamma
+
+    for a in range(n_comp):
+        for b in range(a, n_comp):
+            val = prefactor * coeffs[a] * coeffs[b] * kernel_inner(kernels[a], kernels[b])
+            gram[a, b] = val
+            gram[b, a] = val
+
+    return gram
+
+
+def theoretical_epr_gram_absolute(
+    L: int,
+    shells: Sequence[Shell],
+    gamma: float,
+    omega0: float,
+) -> np.ndarray:
+    """
+    Analytic EPR Gram matrix in the absolute shell basis [I, K_0, K_1, ...].
+
+    The relative SAOU force
+        omega0 R X_i + sum_s a_s R(K_s X_i - c_s X_i)
+    is rewritten as
+        (omega0 - sum_s a_s c_s) R X_i + sum_s a_s R K_s X_i.
+    """
+    if gamma <= 0:
+        raise ValueError("gamma must be positive.")
+
+    N = L * L
+    local_coeff = float(omega0) - sum(
+        float(sh.amplitude) * shell_weight_sum(sh) for sh in shells
+    )
+    coeffs = [local_coeff] + [float(sh.amplitude) for sh in shells]
+    kernels: List[Dict[Offset, float]] = [{(0, 0): 1.0}]
+    kernels.extend(absolute_shell_kernel_dict(sh) for sh in shells)
 
     n_comp = len(coeffs)
     gram = np.zeros((n_comp, n_comp), dtype=np.float64)

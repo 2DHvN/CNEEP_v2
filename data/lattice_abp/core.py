@@ -208,6 +208,56 @@ class LatticeABP:
 
         return O, E
 
+    def encode_state(
+        self,
+        O: torch.Tensor,
+        E: torch.Tensor,
+        *,
+        include_orientation: bool = True,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """Encode the CTMC state as channels for field-based CNEEP models.
+
+        The default representation is
+
+            [occupancy, occupied orientation dy, occupied orientation dx],
+
+        with orientation channels masked by occupancy.  This keeps empty sites
+        at zero and lets short-time shell-force models see both translations
+        and rotations without treating the integer orientation label as an
+        artificial scalar field.
+
+        Args:
+            O: Occupancy tensor with shape (B, L, L).
+            E: Orientation tensor with shape (B, L, L).
+            include_orientation: If False, return occupancy only.
+            dtype: Floating dtype for the encoded tensor.
+
+        Returns:
+            Tensor with shape (B, C, L, L), where C is 3 by default or 1 when
+            include_orientation=False.
+        """
+        if O.shape != E.shape:
+            raise ValueError("O and E must have the same shape.")
+        if O.dim() != 3:
+            raise ValueError("O and E must have shape (B, L, L).")
+
+        occ = O.to(device=self.device, dtype=dtype)
+        orient_idx = E.to(device=self.device, dtype=torch.long)
+        if not include_orientation:
+            return occ.unsqueeze(1)
+
+        orient = self.dir_vecs.to(device=self.device, dtype=dtype)[orient_idx]
+        orient = orient * occ.unsqueeze(-1)
+        return torch.cat(
+            [
+                occ.unsqueeze(1),
+                orient[..., 0].unsqueeze(1),
+                orient[..., 1].unsqueeze(1),
+            ],
+            dim=1,
+        )
+
     # ------------------------------------------------------------------
     # Transition rate computation (branch-free, tensor-based)
     # ------------------------------------------------------------------

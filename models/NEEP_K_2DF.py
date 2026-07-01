@@ -28,9 +28,15 @@ class ExclusiveMaskedConv2d(nn.Module):
       - k>0: only the border (perimeter) of the (2k+1)x(2k+1) kernel
               is learnable; the center pixel is EXCLUDED.
 
-    This ensures each k-branch captures exclusively the contribution
-    from its specific correlation distance, with no overlap between
-    branches.
+    When x_center is provided (k>0), computes the *relative* convolution:
+        out_i = Σ_δ w_δ (X_{i+δ} - X_i)
+    by decomposing into:
+        Σ_δ w_δ X_{i+δ}  −  (Σ_δ w_δ) · X_i
+    i.e.  masked_conv(x_pad)  −  S · x_center,
+    where S[co,ci] = Σ_{h,w} mask·weight  is an effective 1×1 projection.
+
+    This ensures each k-branch captures exclusively the *relative*
+    contribution from its specific correlation distance.
     """
 
     def __init__(self, in_channels: int, out_channels: int, k: int,
@@ -68,10 +74,43 @@ class ExclusiveMaskedConv2d(nn.Module):
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x : [B, C_in, Lx, Ly]  (already periodically padded)."""
-        return F.conv2d(x, self.weight * self.mask, self.bias,
-                        stride=1, padding=0)
+    def forward(self, x: torch.Tensor,
+                x_center: torch.Tensor = None) -> torch.Tensor:
+        """Compute relative masked convolution.
+
+        Parameters
+        ----------
+        x : [B, C_in, Lx+2k, Ly+2k]  periodically padded input (k>0)
+            or [B, C_in, Lx, Ly] for k=0.
+        x_center : [B, C_in, Lx, Ly]  original unpadded input.
+        """
+        if self.k == 0:
+            # k=0: just normal conv2d on the center pixel
+            out = F.conv2d(x, self.weight, self.bias)
+            return out
+
+        # k > 0: Relative convolution: Σ_δ w_δ (X_{i+δ} - X_i)
+        B, C_in, Lx, Ly = x_center.shape
+        out = torch.zeros(B, self.out_channels, Lx, Ly, device=x.device, dtype=x.dtype)
+
+        # Loop over the border offsets of the (2k+1)x(2k+1) kernel
+        for dy in range(-self.k, self.k + 1):
+            for dx in range(-self.k, self.k + 1):
+                # Only border offsets (Chebyshev distance == k)
+                if max(abs(dy), abs(dx)) == self.k:
+                    # Slice of the padded input corresponding to offset (dy, dx)
+                    x_shifted = x[:, :, self.k + dy : self.k + dy + Lx, self.k + dx : self.k + dx + Ly]
+                    # Compute relative displacement (X_{i+δ} - X_i)
+                    x_rel = x_shifted - x_center
+                    # Extract the corresponding 1x1 weight slice [C_out, C_in, 1, 1]
+                    w_delta = self.weight[:, :, self.k + dy, self.k + dx].unsqueeze(-1).unsqueeze(-1)
+                    # Accumulate: out_i += w_δ * (X_{i+δ} - X_i)
+                    out = out + F.conv2d(x_rel, w_delta)
+
+        if self.bias is not None:
+            out = out + self.bias.view(1, -1, 1, 1)
+
+        return out
 
 
 # ──────────────────────────────────────────────────────────────
@@ -80,10 +119,15 @@ class ExclusiveMaskedConv2d(nn.Module):
 class _KBranch2D(nn.Module):
     """One branch for a specific distance *k* with exclusive masking.
 
-    Pipeline (per branch):
-        PeriodicPad2d(k) → ExclusiveMaskedConv2d(kernel=2k+1) → ELU
-        → [Conv2d(1×1) → ELU] × (n_hidden - 1)
+    Pipeline (per branch, k>0):
+        x_center = x
+        PeriodicPad2d(k) → ExclusiveMaskedConv2d(x_pad, x_center)
+        → ELU → [Conv2d(1×1) → ELU] × (n_hidden - 1)
         → Conv2d(1×1)  →  Local EP 2D Map  [B, 1, Lx, Ly]
+
+    For k>0 the masked conv computes the relative interaction
+        Σ_δ w_δ (X_{i+δ} − X_i)
+    so each branch sees only displacement from the center.
     """
 
     def __init__(self, k: int, in_channels: int, hidden_channels: int,
@@ -91,25 +135,35 @@ class _KBranch2D(nn.Module):
         super(_KBranch2D, self).__init__()
         self.k = k
 
-        layers = []
-        if k > 0:
-            layers.append(PeriodicPad2d(k))
+        # Periodic padding (only for k > 0)
+        self.pad = PeriodicPad2d(k) if k > 0 else None
 
-        layers.append(ExclusiveMaskedConv2d(in_channels, hidden_channels, k=k))
-        layers.append(nn.ELU(inplace=True))
+        # First layer: exclusive masked conv (supports relative mode)
+        self.masked_conv = ExclusiveMaskedConv2d(
+            in_channels, hidden_channels, k=k,
+        )
+        self.act = nn.ELU(inplace=True)
 
+        # Remaining 1×1 conv layers
+        post_layers: list = []
         for _ in range(n_hidden - 1):
-            layers.append(nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1))
-            layers.append(nn.ELU(inplace=True))
+            post_layers.append(nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1))
+            post_layers.append(nn.ELU(inplace=True))
 
         # Output to n_components channel (Force vector per position)
-        layers.append(nn.Conv2d(hidden_channels, n_components, kernel_size=1))
-
-        self.net = nn.Sequential(*layers)
+        post_layers.append(nn.Conv2d(hidden_channels, n_components, kernel_size=1))
+        self.post_net = nn.Sequential(*post_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x : [B, seq_len, Lx, Ly]"""
-        return self.net(x)
+        """x : [B, C_in, Lx, Ly]"""
+        x_center = x                                     # unpadded center
+        x_padded = self.pad(x) if self.pad is not None else x
+
+        # Relative masked convolution: Σ_δ w_δ (X_{i+δ} − X_i)
+        h = self.masked_conv(x_padded, x_center=x_center)
+        h = self.act(h)
+
+        return self.post_net(h)
 
 
 # ──────────────────────────────────────────────────────────────
