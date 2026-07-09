@@ -79,6 +79,8 @@ def build_sanity():
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from IPython.display import HTML
 
 from data.ABP import ABPParams, ContinuousABP, ABPFieldizer, recommended_center_grid_size
 
@@ -266,40 +268,94 @@ def build_steady():
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from IPython.display import HTML
 
 from data.ABP import ABPParams, ContinuousABP, ABPFieldizer, recommended_center_grid_size
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", device)""",
     )
-    md(cells, "## 1. Run a longer trajectory")
+    md(cells, "## 1. MIPS-prone parameters")
     code(
         cells,
-        """params = ABPParams(
-    N=256,
-    L=24.0,
-    sigma=1.0,
+        """# MIPS-prone WCA-ABP regime: high persistence and moderately high packing.
+target_phi = 0.50
+N_particles = 512
+sigma = 1.0
+box_L = math.sqrt(N_particles * math.pi * sigma**2 / (4.0 * target_phi))
+
+params = ABPParams(
+    N=N_particles,
+    L=box_L,
+    sigma=sigma,
     epsilon=1.0,
     mobility=1.0,
     force_clip=500.0,
     force_chunk_size=256,
-    v0=12.0,
+    v0=40.0,
     Dr=1.0,
     Dt=0.01,
-    dt=2.0e-4,
+    dt=5.0e-5,
     seed=11,
     device=device,
 )
 
-grid_size = max(40, recommended_center_grid_size(params.L, params.sigma))
+grid_size = max(48, recommended_center_grid_size(params.L, params.sigma))
 fieldizer = ABPFieldizer(params.L, grid_size, params.sigma, mode="center", include_orientation=False, clip_occupancy=False)
 sim = ContinuousABP(params)
 
+print(f"target phi: {target_phi:.3f}")
+print(f"actual phi: {params.phi:.3f}")
+print(f"Pe:         {params.Pe:.2f}")
+print(f"L:          {params.L:.4f}")
+print(f"rc/sigma:   {params.rc / params.sigma:.4f}")
+print(f"grid:       {grid_size}x{grid_size}, dx={fieldizer.dx:.4f}")""",
+    )
+    md(cells, "## 2. WCA potential profile")
+    code(
+        cells,
+        """r = np.linspace(0.82 * params.sigma, 1.8 * params.sigma, 600)
+rc = params.rc
+sigma = params.sigma
+epsilon = params.epsilon
+
+inside = r < rc
+U = np.zeros_like(r)
+F = np.zeros_like(r)
+U[inside] = 4.0 * epsilon * ((sigma / r[inside]) ** 12 - (sigma / r[inside]) ** 6) + epsilon
+F[inside] = 24.0 * epsilon * (2.0 * (sigma / r[inside]) ** 12 - (sigma / r[inside]) ** 6) / r[inside]
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+axes[0].plot(r / sigma, U)
+axes[0].axvline(1.0, color="tab:red", linestyle="--", label="sigma")
+axes[0].axvline(rc / sigma, color="k", linestyle="--", label="rc")
+axes[0].set_xlabel("r / sigma")
+axes[0].set_ylabel("WCA U(r)")
+axes[0].set_title("WCA potential")
+axes[0].legend()
+
+axes[1].plot(r / sigma, F)
+axes[1].axvline(1.0, color="tab:red", linestyle="--", label="sigma")
+axes[1].axvline(rc / sigma, color="k", linestyle="--", label="rc")
+axes[1].set_xlabel("r / sigma")
+axes[1].set_ylabel("|F_WCA(r)|")
+axes[1].set_title("Repulsive force magnitude")
+axes[1].set_yscale("log")
+axes[1].legend()
+
+plt.tight_layout()
+plt.show()""",
+    )
+    md(cells, "## 3. Run a longer trajectory")
+    code(
+        cells,
+        """# Increase burn_in/n_steps for production-quality MIPS coarsening checks.
 result = sim.simulate(
-    B=3,
-    burn_in=2_000,
-    n_steps=6_000,
-    save_interval=60,
+    B=2,
+    burn_in=10_000,
+    n_steps=30_000,
+    save_interval=150,
     fieldizer=fieldizer,
     show_progress=True,
 )
@@ -307,7 +363,7 @@ result = sim.simulate(
 print("phi:", params.phi, "Pe:", params.Pe)
 print("positions:", result["positions"].shape, "fields:", result["fields"].shape)""",
     )
-    md(cells, "## 2. Build observables")
+    md(cells, "## 4. Build observables")
     code(
         cells,
         """time = result["times"].numpy()
@@ -346,7 +402,7 @@ plateau_report("min distance", min_distance)
 plateau_report("low-k power", low_power)
 plateau_report("mean |F|", mean_force)""",
     )
-    md(cells, "## 3. Time-series plateau check")
+    md(cells, "## 5. Time-series plateau check")
     code(
         cells,
         """fig, axes = plt.subplots(4, 1, figsize=(11, 10), sharex=True)
@@ -371,7 +427,7 @@ axes[3].set_xlabel("time")
 plt.tight_layout()
 plt.show()""",
     )
-    md(cells, "## 4. Early/middle/late density snapshots")
+    md(cells, "## 6. Early/middle/late density snapshots")
     code(
         cells,
         """snap_ids = [0, len(time) // 2, len(time) - 1]
@@ -384,7 +440,44 @@ for ax, t in zip(axes, snap_ids):
 plt.tight_layout()
 plt.show()""",
     )
-    md(cells, "## 5. Center-count audit over saved frames")
+    md(cells, "## 7. Particle and count-field animation")
+    code(
+        cells,
+        """ens = 0
+frame_stride = max(1, len(time) // 90)
+frame_ids = np.arange(0, len(time), frame_stride)
+pos_seq = result["positions"].numpy()[:, ens]
+field_seq = fields[:, ens]
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4.5))
+scat = axes[0].scatter(pos_seq[0, :, 0], pos_seq[0, :, 1], s=6, alpha=0.8)
+axes[0].set_xlim(0, params.L)
+axes[0].set_ylim(0, params.L)
+axes[0].set_aspect("equal")
+axes[0].set_title("particles")
+
+vmax = max(1.0, float(np.percentile(field_seq, 99.5)))
+im = axes[1].imshow(field_seq[0].T, origin="lower", cmap="viridis", vmin=0, vmax=vmax)
+axes[1].set_title("center count field")
+plt.colorbar(im, ax=axes[1], fraction=0.046)
+
+title = fig.suptitle("")
+
+def update_anim(k):
+    idx = int(frame_ids[k])
+    scat.set_offsets(pos_seq[idx])
+    im.set_data(field_seq[idx].T)
+    title.set_text(
+        f"ABP MIPS sanity | frame={idx}/{len(time)-1}, t={time[idx]:.3f}, "
+        f"U={potential[idx]:.3g}, low-k={low_power[idx]:.3f}"
+    )
+    return scat, im, title
+
+anim = FuncAnimation(fig, update_anim, frames=len(frame_ids), interval=80, blit=False)
+plt.close(fig)
+HTML(anim.to_jshtml())""",
+    )
+    md(cells, "## 8. Center-count audit over saved frames")
     code(
         cells,
         """multi_center_counts = []
