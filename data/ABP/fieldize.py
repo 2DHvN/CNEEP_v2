@@ -309,10 +309,19 @@ class ABPFieldizer:
 
     def diagnostics(self, pos: torch.Tensor) -> FieldDiagnostics:
         """Return center-bin collision diagnostics for a position batch."""
-        old_mode = self.mode
-        self.mode = "center"
-        _, counts = self.encode(pos, return_counts=True)
-        self.mode = old_mode
+        if pos.dim() == 2:
+            pos = pos.unsqueeze(0)
+        if pos.dim() != 3 or pos.shape[-1] != 2:
+            raise ValueError("pos must have shape [B, N, 2] or [N, 2].")
+
+        B, N, _ = pos.shape
+        H = self.grid_size
+        ix, iy = self._center_indices(pos)
+        linear = ix * H + iy
+        ones = torch.ones(B, N, device=pos.device, dtype=self.dtype)
+        counts = torch.zeros(B, H * H, device=pos.device, dtype=self.dtype)
+        counts.scatter_add_(1, linear, ones)
+        counts = counts.view(B, H, H)
 
         dx_limit = self.particle_diameter / math.sqrt(2.0)
         return FieldDiagnostics(
