@@ -242,6 +242,160 @@ class ContinuousABP:
         _, potential = self.compute_wca_forces(pos, return_potential=True)
         return potential
 
+    def deterministic_drift(self, pos: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
+        """Return the deterministic translational drift ``v0*n(theta) + mu*F``."""
+        if pos.dim() == 2:
+            pos = pos.unsqueeze(0)
+        if theta.dim() == 1:
+            theta = theta.unsqueeze(0)
+        if pos.dim() != 3 or pos.shape[-1] != 2:
+            raise ValueError("pos must have shape [B, N, 2] or [N, 2].")
+        if theta.shape != pos.shape[:2]:
+            raise ValueError("theta must have shape [B, N] matching pos.")
+
+        p = self.params
+        pos = pos.to(device=self.device, dtype=self.dtype)
+        theta = theta.to(device=self.device, dtype=self.dtype)
+        forces = self.compute_wca_forces(pos)
+        direction = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
+        return p.v0 * direction + p.mobility * forces
+
+    def active_medium_entropy_production_increment(
+        self,
+        pos: torch.Tensor,
+        theta: torch.Tensor,
+        pos_next: torch.Tensor,
+        *,
+        sum_particles: bool = True,
+    ) -> torch.Tensor:
+        """Return active-work medium EP increments for one saved ABP step.
+
+        The increment is dimensionless:
+
+        ``(v0 / Dt) * sum_i n_i(theta_t) dot (r_i(t+dt) - r_i(t))``.
+
+        This is exact for the Euler update used by :meth:`step` when adjacent
+        saved frames are separated by one integration step.  For coarser saved
+        intervals, sum this quantity over the underlying integration steps if
+        the intermediate states are available.
+        """
+        p = self.params
+        if p.Dt <= 0:
+            raise ValueError("Active medium EP requires Dt > 0.")
+
+        unbatched = pos.dim() == 2
+        if unbatched:
+            pos = pos.unsqueeze(0)
+            pos_next = pos_next.unsqueeze(0)
+        if theta.dim() == 1:
+            theta = theta.unsqueeze(0)
+        if pos.dim() != 3 or pos.shape[-1] != 2:
+            raise ValueError("pos must have shape [B, N, 2] or [N, 2].")
+        if pos_next.shape != pos.shape:
+            raise ValueError("pos_next must have the same shape as pos.")
+        if theta.shape != pos.shape[:2]:
+            raise ValueError("theta must have shape [B, N] matching pos.")
+
+        pos = pos.to(device=self.device, dtype=self.dtype)
+        pos_next = pos_next.to(device=self.device, dtype=self.dtype)
+        theta = theta.to(device=self.device, dtype=self.dtype)
+
+        delta = self.minimum_image(pos_next - pos)
+        direction = torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
+        per_particle = (p.v0 / p.Dt) * torch.sum(direction * delta, dim=-1)
+        out = per_particle.sum(dim=-1) if sum_particles else per_particle
+        if unbatched:
+            return out.squeeze(0)
+        return out
+
+    def active_medium_entropy_production_sequence(
+        self,
+        positions: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        time_chunk_size: int = 1024,
+        sum_particles: bool = True,
+    ) -> torch.Tensor:
+        """Return active-work medium EP increments for a saved trajectory.
+
+        Parameters
+        ----------
+        positions:
+            Saved positions with shape ``[T, B, N, 2]``.
+        theta:
+            Saved angles with shape ``[T, B, N]``.  The angle at the left
+            endpoint of each pair is used because the simulator's Euler step
+            updates positions from ``theta_t``.
+        time_chunk_size:
+            Number of adjacent saved pairs to process at a time.
+        sum_particles:
+            If True, return total increments with shape ``[B, T-1]``.
+            Otherwise return per-particle increments ``[T-1, B, N]``.
+        """
+        p = self.params
+        if p.Dt <= 0:
+            raise ValueError("Active medium EP requires Dt > 0.")
+        if time_chunk_size <= 0:
+            raise ValueError("time_chunk_size must be positive.")
+        if positions.dim() != 4 or positions.shape[-1] != 2:
+            raise ValueError("positions must have shape [T, B, N, 2].")
+        if theta.shape != positions.shape[:3]:
+            raise ValueError("theta must have shape [T, B, N] matching positions.")
+        if positions.shape[0] < 2:
+            raise ValueError("positions must contain at least two saved frames.")
+
+        chunks = []
+        with torch.no_grad():
+            for start in range(0, positions.shape[0] - 1, time_chunk_size):
+                end = min(start + time_chunk_size, positions.shape[0] - 1)
+                pos0 = positions[start:end].to(device=self.device, dtype=self.dtype)
+                pos1 = positions[start + 1 : end + 1].to(device=self.device, dtype=self.dtype)
+                theta0 = theta[start:end].to(device=self.device, dtype=self.dtype)
+                delta = self.minimum_image(pos1 - pos0)
+                direction = torch.stack([torch.cos(theta0), torch.sin(theta0)], dim=-1)
+                per_particle = (p.v0 / p.Dt) * torch.sum(direction * delta, dim=-1)
+                chunk = per_particle.sum(dim=-1).transpose(0, 1) if sum_particles else per_particle
+                chunks.append(chunk.detach().cpu())
+
+        dim = 1 if sum_particles else 0
+        return torch.cat(chunks, dim=dim)
+
+    def medium_entropy_production_sequence(
+        self,
+        positions: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        potential: Optional[torch.Tensor] = None,
+        time_chunk_size: int = 1024,
+    ) -> torch.Tensor:
+        """Return total medium EP increments for a saved ABP trajectory.
+
+        The active-work part is computed from the particle displacement and
+        orientation.  If ``potential`` is supplied, the conservative WCA heat
+        boundary term ``-(mobility / Dt) * Delta U`` is added.  ``potential``
+        may be shaped either ``[T, B]`` or ``[B, T]``.  The returned tensor has
+        shape ``[B, T-1]``.
+        """
+        active = self.active_medium_entropy_production_sequence(
+            positions,
+            theta,
+            time_chunk_size=time_chunk_size,
+            sum_particles=True,
+        )
+        if potential is None:
+            return active
+
+        pot = torch.as_tensor(potential, dtype=active.dtype)
+        T, B = positions.shape[:2]
+        if pot.shape == (T, B):
+            dU = (pot[1:] - pot[:-1]).transpose(0, 1)
+        elif pot.shape == (B, T):
+            dU = pot[:, 1:] - pot[:, :-1]
+        else:
+            raise ValueError("potential must have shape [T, B] or [B, T].")
+        boundary = -(self.params.mobility / self.params.Dt) * dU
+        return active + boundary
+
     # ------------------------------------------------------------------
     # Dynamics
     # ------------------------------------------------------------------
@@ -291,6 +445,7 @@ class ContinuousABP:
         fieldizer=None,
         show_progress: bool = True,
         save_diagnostics: bool = True,
+        save_exact_medium_ep: bool = False,
     ) -> Dict[str, torch.Tensor]:
         """Run a simulation and return CPU tensors.
 
@@ -299,6 +454,9 @@ class ContinuousABP:
         ``positions``: ``[T, B, N, 2]``
         ``theta``: ``[T, B, N]``
         ``fields``: ``[T, B, C, H, W]`` when a fieldizer is supplied.
+        ``exact_medium_ep``: ``[B, T-1]`` when ``save_exact_medium_ep=True``.
+        Exact medium EP also saves potential diagnostics because the WCA
+        boundary term is computed from saved-frame potential differences.
         """
         try:
             from tqdm import trange
@@ -307,6 +465,8 @@ class ContinuousABP:
 
         if save_interval <= 0:
             raise ValueError("save_interval must be positive.")
+        if save_exact_medium_ep and self.params.Dt <= 0:
+            raise ValueError("Exact medium EP requires Dt > 0.")
 
         if initial_state is None:
             pos, theta = self.initialize_lattice(B)
@@ -336,12 +496,19 @@ class ContinuousABP:
             )
 
         diag: Dict[str, torch.Tensor] = {}
-        if save_diagnostics:
+        diagnostics_enabled = save_diagnostics or save_exact_medium_ep
+        if diagnostics_enabled:
             diag = {
                 "potential": torch.empty(n_saved, B, dtype=self.dtype, device=self.device),
                 "min_distance": torch.empty(n_saved, B, dtype=self.dtype, device=self.device),
                 "mean_force_norm": torch.empty(n_saved, B, dtype=self.dtype, device=self.device),
             }
+
+        exact_active_ep = None
+        active_ep_accum = None
+        if save_exact_medium_ep:
+            exact_active_ep = torch.empty(B, n_saved - 1, dtype=self.dtype, device=self.device)
+            active_ep_accum = torch.zeros(B, dtype=self.dtype, device=self.device)
 
         def save_frame(save_idx: int, step: int) -> None:
             positions[save_idx] = pos
@@ -349,7 +516,7 @@ class ContinuousABP:
             times[save_idx] = step * self.params.dt
             if fields is not None:
                 fields[save_idx] = fieldizer.encode(pos, theta)
-            if save_diagnostics:
+            if diagnostics_enabled:
                 _, potential, min_distance = self.compute_wca_forces(
                     pos,
                     return_potential=True,
@@ -369,7 +536,23 @@ class ContinuousABP:
                     save_frame(save_idx, step)
                     save_idx += 1
                 if step < n_steps:
+                    pos_prev = pos
+                    theta_prev = theta
                     pos, theta = self.step(pos, theta)
+                    if save_exact_medium_ep:
+                        delta = self.minimum_image(pos - pos_prev)
+                        direction = torch.stack([torch.cos(theta_prev), torch.sin(theta_prev)], dim=-1)
+                        active_step = (self.params.v0 / self.params.Dt) * torch.sum(
+                            direction * delta,
+                            dim=-1,
+                        ).sum(dim=-1)
+                        active_ep_accum = active_ep_accum + active_step
+                        next_step = step + 1
+                        if next_step % save_interval == 0:
+                            interval_idx = next_step // save_interval - 1
+                            if interval_idx < exact_active_ep.shape[1]:
+                                exact_active_ep[:, interval_idx] = active_ep_accum
+                            active_ep_accum = torch.zeros_like(active_ep_accum)
 
         out = {
             "positions": positions.cpu(),
@@ -381,6 +564,14 @@ class ContinuousABP:
             out["fields"] = fields.cpu()
         for key, value in diag.items():
             out[key] = value.cpu()
+        if save_exact_medium_ep:
+            potential = diag["potential"]
+            wca_boundary_ep = -(self.params.mobility / self.params.Dt) * (
+                potential[1:] - potential[:-1]
+            ).transpose(0, 1)
+            out["exact_active_medium_ep"] = exact_active_ep.cpu()
+            out["exact_wca_boundary_ep"] = wca_boundary_ep.cpu()
+            out["exact_medium_ep"] = (exact_active_ep + wca_boundary_ep).cpu()
         return out
 
     # ------------------------------------------------------------------

@@ -37,6 +37,7 @@ def main():
         save_interval=2,
         fieldizer=fieldizer,
         show_progress=False,
+        save_exact_medium_ep=True,
     )
 
     assert result["positions"].shape == (3, 2, params.N, 2)
@@ -46,6 +47,24 @@ def main():
     diag = fieldizer.diagnostics_dict(result["positions"][-1])
     assert diag["center_exclusive_rule_ok"]
     assert diag["multi_center_pixels"] == 0
+
+    active_ep = sim.active_medium_entropy_production_sequence(
+        result["positions"],
+        result["theta"],
+    )
+    medium_ep = sim.medium_entropy_production_sequence(
+        result["positions"],
+        result["theta"],
+        potential=result["potential"],
+    )
+    assert active_ep.shape == (2, 2)
+    assert medium_ep.shape == (2, 2)
+    assert torch.isfinite(active_ep).all()
+    assert torch.isfinite(medium_ep).all()
+    assert result["exact_active_medium_ep"].shape == (2, 2)
+    assert result["exact_wca_boundary_ep"].shape == (2, 2)
+    assert result["exact_medium_ep"].shape == (2, 2)
+    assert torch.isfinite(result["exact_medium_ep"]).all()
 
     gaussian = ABPFieldizer(
         params.L,
