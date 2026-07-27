@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,13 +21,74 @@ class PeriodicPad2d(nn.Module):
         return F.pad(x, self.padding, mode='circular')
 
 
+def _canonical_kernel_geometry(kernel_geometry: str) -> str:
+    geometry = str(kernel_geometry).lower()
+    aliases = {
+        "chebyshev": "chebyshev",
+        "square": "chebyshev",
+        "linf": "chebyshev",
+        "l_inf": "chebyshev",
+        "euclidean": "euclidean",
+        "annulus": "euclidean",
+        "l2": "euclidean",
+        "l_2": "euclidean",
+    }
+    if geometry not in aliases:
+        raise ValueError("kernel_geometry must be 'chebyshev' or 'euclidean'.")
+    return aliases[geometry]
+
+
+def _exclusive_offsets(
+    k: int,
+    kernel_geometry: str,
+    shell_width: float = 1.0,
+    shell_offset: float = 0.0,
+):
+    """Return offsets and display bounds for one exclusive K shell."""
+    if k < 0:
+        raise ValueError("k must be non-negative.")
+
+    geometry = _canonical_kernel_geometry(kernel_geometry)
+    if k == 0:
+        return [(0, 0)], 0, 0.0, 0.0
+
+    if geometry == "chebyshev":
+        offsets = [
+            (dy, dx)
+            for dy in range(-k, k + 1)
+            for dx in range(-k, k + 1)
+            if max(abs(dy), abs(dx)) == k
+        ]
+        return offsets, k, float(max(k - 1, 0)), float(k)
+
+    if shell_width <= 0:
+        raise ValueError("shell_width must be positive for Euclidean kernels.")
+    r_inner = max(0.0, shell_offset + (k - 0.5) * shell_width)
+    r_outer = shell_offset + (k + 0.5) * shell_width
+    radius = int(math.ceil(r_outer))
+    offsets = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dy == 0 and dx == 0:
+                continue
+            r = math.sqrt(float(dy * dy + dx * dx))
+            if r_inner < r <= r_outer + 1e-12:
+                offsets.append((dy, dx))
+    if not offsets:
+        raise ValueError(
+            f"Empty Euclidean K shell for k={k}, shell_width={shell_width}, "
+            f"shell_offset={shell_offset}."
+        )
+    return offsets, radius, r_inner, r_outer
+
+
 # ──────────────────────────────────────────────────────────────
 # Exclusive Masked 2D Convolution
 # ──────────────────────────────────────────────────────────────
 class ExclusiveMaskedConv2d(nn.Module):
     """Conv2d whose kernel is masked so that:
       - k=0: only the center pixel is learnable.
-      - k>0: only the border (perimeter) of the (2k+1)x(2k+1) kernel
+      - k>0: only one exclusive Chebyshev perimeter or Euclidean annulus
               is learnable; the center pixel is EXCLUDED.
 
     When x_center is provided (k>0), computes the *relative* convolution:
@@ -39,13 +102,35 @@ class ExclusiveMaskedConv2d(nn.Module):
     contribution from its specific correlation distance.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, k: int,
-                 bias: bool = True):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        k: int,
+        bias: bool = True,
+        kernel_geometry: str = "chebyshev",
+        shell_width: float = 1.0,
+        shell_offset: float = 0.0,
+    ):
         super(ExclusiveMaskedConv2d, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.k = k
-        self.kernel_size = 2 * k + 1
+        self.kernel_geometry = _canonical_kernel_geometry(kernel_geometry)
+        self.shell_width = float(shell_width)
+        self.shell_offset = float(shell_offset)
+
+        offsets, radius, r_inner, r_outer = _exclusive_offsets(
+            k,
+            self.kernel_geometry,
+            shell_width=self.shell_width,
+            shell_offset=self.shell_offset,
+        )
+        self.radius = radius
+        self.r_inner = float(r_inner)
+        self.r_outer = float(r_outer)
+        self._offsets_list = offsets
+        self.kernel_size = 2 * radius + 1
 
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels, self.kernel_size, self.kernel_size)
@@ -57,18 +142,11 @@ class ExclusiveMaskedConv2d(nn.Module):
 
         # Build the exclusive binary mask
         mask = torch.zeros(1, 1, self.kernel_size, self.kernel_size)
-        if k == 0:
-            # k=0: center only
-            mask[0, 0, 0, 0] = 1.0
-        else:
-            # k>0: border only, center excluded
-            mask[0, 0, 0, :] = 1.0        # Top edge
-            mask[0, 0, 2 * k, :] = 1.0    # Bottom edge
-            mask[0, 0, :, 0] = 1.0        # Left edge
-            mask[0, 0, :, 2 * k] = 1.0    # Right edge
-            mask[0, 0, k, k] = 0.0        # Explicitly exclude center
+        for dy, dx in offsets:
+            mask[0, 0, radius + dy, radius + dx] = 1.0
 
         self.register_buffer("mask", mask)
+        self.register_buffer("offsets", torch.tensor(offsets, dtype=torch.long))
 
         nn.init.kaiming_normal_(self.weight, mode="fan_out", nonlinearity="relu")
         if self.bias is not None:
@@ -89,23 +167,24 @@ class ExclusiveMaskedConv2d(nn.Module):
             out = F.conv2d(x, self.weight, self.bias)
             return out
 
+        if x_center is None:
+            raise ValueError("x_center is required for k > 0 relative convolution.")
+
         # k > 0: Relative convolution: Σ_δ w_δ (X_{i+δ} - X_i)
         B, C_in, Lx, Ly = x_center.shape
         out = torch.zeros(B, self.out_channels, Lx, Ly, device=x.device, dtype=x.dtype)
 
-        # Loop over the border offsets of the (2k+1)x(2k+1) kernel
-        for dy in range(-self.k, self.k + 1):
-            for dx in range(-self.k, self.k + 1):
-                # Only border offsets (Chebyshev distance == k)
-                if max(abs(dy), abs(dx)) == self.k:
-                    # Slice of the padded input corresponding to offset (dy, dx)
-                    x_shifted = x[:, :, self.k + dy : self.k + dy + Lx, self.k + dx : self.k + dx + Ly]
-                    # Compute relative displacement (X_{i+δ} - X_i)
-                    x_rel = x_shifted - x_center
-                    # Extract the corresponding 1x1 weight slice [C_out, C_in, 1, 1]
-                    w_delta = self.weight[:, :, self.k + dy, self.k + dx].unsqueeze(-1).unsqueeze(-1)
-                    # Accumulate: out_i += w_δ * (X_{i+δ} - X_i)
-                    out = out + F.conv2d(x_rel, w_delta)
+        # Loop over the selected exclusive offsets.
+        for dy, dx in self._offsets_list:
+            x_shifted = x[
+                :,
+                :,
+                self.radius + dy : self.radius + dy + Lx,
+                self.radius + dx : self.radius + dx + Ly,
+            ]
+            x_rel = x_shifted - x_center
+            w_delta = self.weight[:, :, self.radius + dy, self.radius + dx].unsqueeze(-1).unsqueeze(-1)
+            out = out + F.conv2d(x_rel, w_delta)
 
         if self.bias is not None:
             out = out + self.bias.view(1, -1, 1, 1)
@@ -130,18 +209,36 @@ class _KBranch2D(nn.Module):
     so each branch sees only displacement from the center.
     """
 
-    def __init__(self, k: int, in_channels: int, hidden_channels: int,
-                 n_hidden: int = 2, n_components: int = 1):
+    def __init__(
+        self,
+        k: int,
+        in_channels: int,
+        hidden_channels: int,
+        n_hidden: int = 2,
+        n_components: int = 1,
+        kernel_geometry: str = "chebyshev",
+        shell_width: float = 1.0,
+        shell_offset: float = 0.0,
+    ):
         super(_KBranch2D, self).__init__()
         self.k = k
 
-        # Periodic padding (only for k > 0)
-        self.pad = PeriodicPad2d(k) if k > 0 else None
-
         # First layer: exclusive masked conv (supports relative mode)
         self.masked_conv = ExclusiveMaskedConv2d(
-            in_channels, hidden_channels, k=k,
+            in_channels,
+            hidden_channels,
+            k=k,
+            kernel_geometry=kernel_geometry,
+            shell_width=shell_width,
+            shell_offset=shell_offset,
         )
+        self.kernel_geometry = self.masked_conv.kernel_geometry
+        self.radius = self.masked_conv.radius
+        self.r_inner = self.masked_conv.r_inner
+        self.r_outer = self.masked_conv.r_outer
+
+        # Periodic padding (only for nonlocal shells)
+        self.pad = PeriodicPad2d(self.radius) if self.radius > 0 else None
         self.act = nn.ELU(inplace=True)
 
         # Remaining 1×1 conv layers
@@ -216,6 +313,9 @@ class MultiScaleK_2DF(nn.Module):
         in_channels = opt.seq_len * self.n_components + (2 if opt.positional else 0)
         hidden_channels = opt.n_channel
         n_hidden = getattr(opt, "n_hidden", 2)
+        self.k_kernel_geometry = _canonical_kernel_geometry(getattr(opt, "k_kernel_geometry", "chebyshev"))
+        self.shell_width = float(getattr(opt, "shell_width", 1.0))
+        self.shell_offset = float(getattr(opt, "shell_offset", 0.0))
 
         self.include_k0 = getattr(opt, "include_k0", True)
         start_k = 0 if self.include_k0 else 1
@@ -227,7 +327,10 @@ class MultiScaleK_2DF(nn.Module):
                 in_channels=in_channels,
                 hidden_channels=hidden_channels,
                 n_hidden=n_hidden,
-                n_components=self.n_components
+                n_components=self.n_components,
+                kernel_geometry=self.k_kernel_geometry,
+                shell_width=self.shell_width,
+                shell_offset=self.shell_offset,
             )
             for k in range(start_k, self.max_distance + 1)
         ])
@@ -244,6 +347,10 @@ class MultiScaleK_2DF(nn.Module):
                    branch: _KBranch2D) -> torch.Tensor:
         """Run one branch on input *x* and return [B, 1, Lx, Ly] local EP map."""
         return branch(x)
+
+    def shell_bounds(self):
+        """Return display bounds in pixel units for each exclusive branch."""
+        return [(branch.r_inner, branch.r_outer) for branch in self.branches]
 
     # ----- forward ----- #
     def forward(self, x: torch.Tensor, return_maps: bool = False) -> torch.Tensor:
