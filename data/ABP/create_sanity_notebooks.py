@@ -79,6 +79,9 @@ def build_sanity():
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+import os
+from pathlib import Path
+from matplotlib import animation as mpl_animation
 from matplotlib.animation import FuncAnimation
 from IPython.display import HTML
 
@@ -268,94 +271,139 @@ def build_steady():
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
+from pathlib import Path
+from matplotlib import animation as mpl_animation
 from matplotlib.animation import FuncAnimation
 from IPython.display import HTML
 
-from data.ABP import ABPParams, ContinuousABP, ABPFieldizer, recommended_center_grid_size
+from data.ABP import ABPParams, ContinuousABP, ABPFieldizer
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print("device:", device)""",
     )
-    md(cells, "## 1. MIPS-prone parameters")
+    md(cells, "## 1. Fixed grid, WCA range, and phi knobs")
     code(
         cells,
-        """# MIPS-prone WCA-ABP regime: high persistence and moderately high packing.
-target_phi = 0.50
-N_particles = 512
-sigma = 1.0
-box_L = math.sqrt(N_particles * math.pi * sigma**2 / (4.0 * target_phi))
+        """# Change these four knobs first.
+# grid_size and dx are fixed; changing target_phi changes N, not the box/grid.
+target_phi = 0.60
+grid_size = 32
+dx = 2.0
+wca_cutoff_pixels = 2.5  # set to 2.0, 2.5, or 3.0 to choose the WCA reach in pixels
+
+box_L = grid_size * dx
+sigma = wca_cutoff_pixels * dx / (2.0 ** (1.0 / 6.0))
+N_particles = max(1, int(round(4.0 * target_phi * box_L**2 / (math.pi * sigma**2))))
 
 params = ABPParams(
     N=N_particles,
     L=box_L,
     sigma=sigma,
-    epsilon=1.0,
+    epsilon=0.5,
     mobility=1.0,
     force_clip=500.0,
-    force_chunk_size=256,
-    v0=40.0,
-    Dr=1.0,
-    Dt=0.01,
-    dt=5.0e-5,
+    force_chunk_size=65536,
+    v0=10,
+    Dr=1e-6,
+    Dt=1e-6,
+    dt=1e-4,
     seed=11,
     device=device,
 )
 
-grid_size = max(48, recommended_center_grid_size(params.L, params.sigma))
-fieldizer = ABPFieldizer(params.L, grid_size, params.sigma, mode="center", include_orientation=False, clip_occupancy=False)
+fieldizer = ABPFieldizer(
+    params.L, grid_size, params.sigma,
+    mode="gaussian", include_orientation=False, clip_occupancy=False,
+    gaussian_sigma=0.5 * params.sigma,
+)
 sim = ContinuousABP(params)
 
 print(f"target phi: {target_phi:.3f}")
 print(f"actual phi: {params.phi:.3f}")
+print(f"N:          {params.N}")
 print(f"Pe:         {params.Pe:.2f}")
 print(f"L:          {params.L:.4f}")
-print(f"rc/sigma:   {params.rc / params.sigma:.4f}")
-print(f"grid:       {grid_size}x{grid_size}, dx={fieldizer.dx:.4f}")""",
+print(f"dx:         {fieldizer.dx:.4f}")
+print(f"sigma:      {params.sigma:.4f} ({params.sigma / fieldizer.dx:.3f} px)")
+print(f"epsilon:    {params.epsilon:.3f}")
+print(f"rc:         {params.rc:.4f} ({params.rc / fieldizer.dx:.3f} px)")
+print(f"grid:       {grid_size}x{grid_size}")
+print(f"field mode: {fieldizer.mode} cloud, gaussian_sigma={fieldizer.gaussian_sigma:.4f}")""",
     )
     md(cells, "## 2. WCA potential profile")
     code(
         cells,
-        """r = np.linspace(0.82 * params.sigma, 1.8 * params.sigma, 600)
-rc = params.rc
+        """rc = params.rc
 sigma = params.sigma
 epsilon = params.epsilon
+dx = fieldizer.dx
 
-inside = r < rc
-U = np.zeros_like(r)
-F = np.zeros_like(r)
-U[inside] = 4.0 * epsilon * ((sigma / r[inside]) ** 12 - (sigma / r[inside]) ** 6) + epsilon
-F[inside] = 24.0 * epsilon * (2.0 * (sigma / r[inside]) ** 12 - (sigma / r[inside]) ** 6) / r[inside]
+r_min = max(0.75 * sigma, 0.5 * dx)
+r_max = max((wca_cutoff_pixels + 0.75) * dx, 1.15 * rc)
+r = np.linspace(r_min, r_max, 900)
+r_pixels = r / dx
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-axes[0].plot(r / sigma, U)
-axes[0].axvline(1.0, color="tab:red", linestyle="--", label="sigma")
-axes[0].axvline(rc / sigma, color="k", linestyle="--", label="rc")
-axes[0].set_xlabel("r / sigma")
+def wca_u_force(r_values):
+    r_values = np.asarray(r_values, dtype=np.float64)
+    inside = r_values < rc
+    U_values = np.zeros_like(r_values)
+    F_values = np.zeros_like(r_values)
+    U_values[inside] = 4.0 * epsilon * ((sigma / r_values[inside]) ** 12 - (sigma / r_values[inside]) ** 6) + epsilon
+    F_values[inside] = 24.0 * epsilon * (
+        2.0 * (sigma / r_values[inside]) ** 12 - (sigma / r_values[inside]) ** 6
+    ) / r_values[inside]
+    return U_values, F_values
+
+U, F = wca_u_force(r)
+check_pixels = np.array(sorted({2.0, float(wca_cutoff_pixels), 3.0}))
+check_r = check_pixels * dx
+check_U, check_F = wca_u_force(check_r)
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+axes[0].plot(r_pixels, U, lw=2)
+axes[0].scatter(check_pixels, check_U, s=55, color="tab:red", zorder=5)
+axes[0].axvspan(2.0, 3.0, color="tab:blue", alpha=0.08, label="2-3 px")
+axes[0].axvline(rc / dx, color="k", linestyle="--", label=f"rc={rc / dx:.2f} px")
+axes[0].axvline(sigma / dx, color="tab:orange", linestyle="--", label=f"sigma={sigma / dx:.2f} px")
+axes[0].set_xlabel("r / dx [pixels]")
 axes[0].set_ylabel("WCA U(r)")
-axes[0].set_title("WCA potential")
+axes[0].set_title("Potential in pixel units")
 axes[0].legend()
 
-axes[1].plot(r / sigma, F)
-axes[1].axvline(1.0, color="tab:red", linestyle="--", label="sigma")
-axes[1].axvline(rc / sigma, color="k", linestyle="--", label="rc")
-axes[1].set_xlabel("r / sigma")
+positive = F > 0
+axes[1].plot(r_pixels[positive], F[positive])
+axes[1].scatter(check_pixels, check_F, s=55, color="tab:red", zorder=5)
+axes[1].axvspan(2.0, 3.0, color="tab:blue", alpha=0.08, label="2-3 px")
+axes[1].axvline(rc / dx, color="k", linestyle="--", label=f"rc={rc / dx:.2f} px")
+axes[1].set_xlabel("r / dx [pixels]")
 axes[1].set_ylabel("|F_WCA(r)|")
 axes[1].set_title("Repulsive force magnitude")
 axes[1].set_yscale("log")
 axes[1].legend()
 
+axes[2].bar([f"{px:g} px" for px in check_pixels], check_U, color="tab:purple", alpha=0.75)
+axes[2].set_ylabel("WCA U(r)")
+axes[2].set_title("Pixel checkpoints")
+
 plt.tight_layout()
-plt.show()""",
+plt.show()
+
+print("WCA pixel checkpoints")
+print(f"  sigma = {sigma:.6g} = {sigma / dx:.3f} px")
+print(f"  rc    = {rc:.6g} = {rc / dx:.3f} px")
+for px, uu, ff in zip(check_pixels, check_U, check_F):
+    print(f"  r={px:.3f} px: U={uu:.6g}, |F|={ff:.6g}")
+print("Change wca_cutoff_pixels in the first parameter cell to move the WCA support across the fixed grid.")""",
     )
     md(cells, "## 3. Run a longer trajectory")
     code(
         cells,
         """# Increase burn_in/n_steps for production-quality MIPS coarsening checks.
 result = sim.simulate(
-    B=2,
-    burn_in=10_000,
-    n_steps=30_000,
-    save_interval=150,
+    B=1,
+    burn_in=0,
+    n_steps=2_000_000,
+    save_interval=1000,
     fieldizer=fieldizer,
     show_progress=True,
 )
@@ -458,7 +506,7 @@ axes[0].set_title("particles")
 
 vmax = max(1.0, float(np.percentile(field_seq, 99.5)))
 im = axes[1].imshow(field_seq[0].T, origin="lower", cmap="viridis", vmin=0, vmax=vmax)
-axes[1].set_title("center count field")
+axes[1].set_title(f"{fieldizer.mode} field")
 plt.colorbar(im, ax=axes[1], fraction=0.046)
 
 title = fig.suptitle("")
@@ -474,8 +522,80 @@ def update_anim(k):
     return scat, im, title
 
 anim = FuncAnimation(fig, update_anim, frames=len(frame_ids), interval=80, blit=False)
+
+import os
+from pathlib import Path
+from matplotlib import animation as mpl_animation
+
+output_dir = Path(CNEEP_V2_ROOT) / "results" / "abp_steady_state_sanity"
+output_dir.mkdir(parents=True, exist_ok=True)
+video_stem = output_dir / "steady_state_particles_field"
+save_fps = 25
+save_dpi = 120
+saved_paths = []
+save_errors = []
+
+def _clean_ffmpeg_env():
+    # Singularity can inject GL libraries that require a newer glibc than the
+    # host ffmpeg sees.  Remove those entries only while ffmpeg is launched.
+    old_env = {
+        "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH"),
+        "LD_PRELOAD": os.environ.get("LD_PRELOAD"),
+    }
+    lib_path = os.environ.get("LD_LIBRARY_PATH", "")
+    clean_parts = [
+        part for part in lib_path.split(os.pathsep)
+        if part and not part.startswith("/.singularity.d/libs")
+    ]
+    if clean_parts:
+        os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(clean_parts)
+    else:
+        os.environ.pop("LD_LIBRARY_PATH", None)
+    os.environ.pop("LD_PRELOAD", None)
+    return old_env
+
+def _restore_env(old_env):
+    for key, value in old_env.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+for writer_name, suffix in [("ffmpeg", ".mp4"), ("pillow", ".gif")]:
+    old_env = _clean_ffmpeg_env() if writer_name == "ffmpeg" else None
+    try:
+        if not mpl_animation.writers.is_available(writer_name):
+            save_errors.append(f"{writer_name}: writer unavailable")
+            continue
+        path = video_stem.with_suffix(suffix)
+        if writer_name == "ffmpeg":
+            writer = mpl_animation.FFMpegWriter(fps=save_fps, bitrate=1800)
+            anim.save(str(path), writer=writer, dpi=save_dpi)
+        else:
+            writer = mpl_animation.PillowWriter(fps=save_fps)
+            anim.save(str(path), writer=writer, dpi=save_dpi)
+        saved_paths.append(path)
+        break
+    except Exception as exc:
+        save_errors.append(f"{writer_name}: {exc}")
+    finally:
+        if old_env is not None:
+            _restore_env(old_env)
+
+if not saved_paths:
+    html_path = video_stem.with_suffix(".html")
+    old_limit = plt.rcParams.get("animation.embed_limit", 20.0)
+    try:
+        plt.rcParams["animation.embed_limit"] = max(float(old_limit), 300.0)
+        html_path.write_text(anim.to_jshtml(fps=save_fps), encoding="utf-8")
+        saved_paths.append(html_path)
+    finally:
+        plt.rcParams["animation.embed_limit"] = old_limit
+
 plt.close(fig)
-HTML(anim.to_jshtml())""",
+links = "<br>".join(f'<a href="{p.resolve().as_uri()}">{p.name}</a>' for p in saved_paths)
+details = "<br>".join(save_errors)
+HTML(f"<b>Saved animation:</b><br>{links}<br><small>{details}</small>")""",
     )
     md(cells, "## 8. Center-count audit over saved frames")
     code(
@@ -502,6 +622,8 @@ plt.show()
 print("max multi-center pixels over saved frames:", int(multi_center_counts.max()))
 print("max center count over saved frames:", int(max_center_counts.max()))
 print("fieldizer dx:", fieldizer.dx)
+print("sigma pixels:", params.sigma / fieldizer.dx)
+print("WCA cutoff pixels:", params.rc / fieldizer.dx)
 print("hard-core diagnostic dx limit:", params.sigma / math.sqrt(2.0))""",
     )
     return cells
