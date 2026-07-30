@@ -8,12 +8,28 @@ hop-wise true medium entropy production.
 from __future__ import annotations
 
 import math
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
+
+from ._cuda_backend import (
+    CudaBackendUnavailable,
+    cuda_backend_buildable,
+    cuda_sweep_inplace,
+    load_cuda_backend,
+    prepare_cuda_sweep_inputs,
+)
+from ._numba_backend import (
+    NUMBA_AVAILABLE,
+    active_work_from_theta_vectorized,
+    numba_sweep_inplace,
+    prepare_sweep_random_inputs,
+    require_numba,
+)
 
 
 def choose_device(device: str | torch.device = "auto") -> torch.device:
@@ -71,6 +87,9 @@ class ThermodynamicLatticeABPParams:
     seed: Optional[int] = 0
     device: str = "auto"
     dtype: str = "float32"
+    # Keep the finite-precision Torch reference as the library default. Demos
+    # opt into "auto", which selects a device-specific fused exact backend.
+    backend: str = "torch"
 
     @property
     def dl(self) -> float:
@@ -142,11 +161,22 @@ class ThermodynamicLatticeABP:
         self._validate_params()
         self.device = choose_device(params.device)
         self.dtype = params.torch_dtype
+        self.backend = self._resolve_backend(params.backend)
         set_seed(params.seed, self.device)
 
         self.dir_sites = self._DIR_SITES_CPU.to(self.device)
         self.dir_vectors = self.dir_sites.to(dtype=self.dtype) * params.dl
         self._kernel_offsets, self._kernel_values = self._build_wca_kernel()
+        neighbor_linear = self._build_neighbor_linear_lookup()
+        if self.backend == "cuda_fused" and neighbor_linear is not None:
+            # The custom kernel accepts compact int32 site indices. The dense
+            # long lookup is not retained, so the cache costs only ~2.5 MiB
+            # for the default G=96, K=68 geometry.
+            self._cuda_neighbor_linear = neighbor_linear.to(torch.int32)
+            self._neighbor_linear = None
+        else:
+            self._cuda_neighbor_linear = None
+            self._neighbor_linear = neighbor_linear
 
     # ------------------------------------------------------------------
     # Parameter and geometry helpers
@@ -184,8 +214,62 @@ class ThermodynamicLatticeABP:
             raise ValueError("Dr must be nonnegative and dt must be positive.")
         if p.prefactor.lower() not in {"c0", "cv"}:
             raise ValueError("prefactor must be 'c0' or 'cv'.")
+        if p.backend.lower() not in {
+            "auto",
+            "cuda_fused",
+            "torch",
+            "numba",
+        }:
+            raise ValueError(
+                "backend must be 'auto', 'cuda_fused', 'torch', or 'numba'."
+            )
         if p.N > p.grid_size * p.grid_size:
             raise ValueError("N cannot exceed the number of lattice sites.")
+
+    def _resolve_backend(self, backend: str) -> str:
+        normalized = backend.lower()
+        if normalized == "auto":
+            if self.device.type == "cuda":
+                if cuda_backend_buildable():
+                    try:
+                        load_cuda_backend()
+                    except CudaBackendUnavailable as exc:
+                        warnings.warn(
+                            "The fused CUDA backend could not be loaded; "
+                            "using the exact fixed-shape Torch CUDA fallback. "
+                            f"Reason: {exc}",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                    else:
+                        return "cuda_fused"
+                else:
+                    warnings.warn(
+                        "The fused CUDA backend is not buildable (a CUDA "
+                        "toolkit/nvcc, compatible host compiler, and Ninja "
+                        "are required); using the exact fixed-shape Torch "
+                        "CUDA fallback.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                return "torch"
+            if self.device.type == "cpu" and NUMBA_AVAILABLE:
+                return "numba"
+            return "torch"
+        if normalized == "cuda_fused":
+            if self.device.type != "cuda":
+                raise ValueError(
+                    "backend='cuda_fused' requires a CUDA device."
+                )
+            # Explicit selection is fail-fast: never silently replace the
+            # requested implementation with a slower backend.
+            load_cuda_backend()
+            return normalized
+        if normalized == "numba":
+            if self.device.type != "cpu":
+                raise ValueError("backend='numba' requires a CPU device.")
+            require_numba()
+        return normalized
 
     def _build_wca_kernel(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """Precompute WCA energies for lattice offsets inside the cutoff."""
@@ -213,6 +297,45 @@ class ThermodynamicLatticeABP:
             torch.tensor(offsets, dtype=torch.long, device=self.device),
             torch.tensor(values, dtype=self.dtype, device=self.device),
         )
+
+    def _build_neighbor_linear_lookup(self) -> Optional[torch.Tensor]:
+        """Precompute exact periodic WCA-neighbor indices for CUDA gathers.
+
+        Integer geometry does not change during a run.  Caching it removes the
+        modulo and coordinate arithmetic from every particle proposal.  The
+        lookup is CUDA-only and capped so unusually large grids do not acquire
+        an unexpectedly large persistent allocation.
+        """
+        if (
+            self.device.type != "cuda"
+            or self.params.epsilon == 0
+            or self._kernel_offsets.numel() == 0
+        ):
+            return None
+        entry_count = (
+            self.grid_size
+            * self.grid_size
+            * int(self._kernel_offsets.shape[0])
+        )
+        max_lookup_bytes = 512 * 1024 * 1024
+        index_bytes = torch.empty((), dtype=torch.long).element_size()
+        if entry_count * index_bytes > max_lookup_bytes:
+            return None
+
+        linear = torch.arange(
+            self.grid_size * self.grid_size,
+            device=self.device,
+            dtype=torch.long,
+        )
+        x = torch.div(linear, self.grid_size, rounding_mode="floor")
+        y = linear.remainder(self.grid_size)
+        neighbor_x = (
+            x.unsqueeze(1) + self._kernel_offsets[:, 0].unsqueeze(0)
+        ).remainder(self.grid_size)
+        neighbor_y = (
+            y.unsqueeze(1) + self._kernel_offsets[:, 1].unsqueeze(0)
+        ).remainder(self.grid_size)
+        return (neighbor_x * self.grid_size + neighbor_y).contiguous()
 
     def minimum_image(self, delta: torch.Tensor) -> torch.Tensor:
         """Apply square periodic minimum-image convention to physical deltas."""
@@ -293,7 +416,12 @@ class ThermodynamicLatticeABP:
     # WCA energetics
     # ------------------------------------------------------------------
 
-    def _local_wca_energy(self, occupancy: torch.Tensor, sites: torch.Tensor) -> torch.Tensor:
+    def _local_wca_energy(
+        self,
+        occupancy: torch.Tensor,
+        sites: torch.Tensor,
+        batch_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Return WCA energy of test particles at ``sites`` against occupancy."""
         if sites.dim() == 2:
             sites = sites.unsqueeze(1)
@@ -301,17 +429,38 @@ class ThermodynamicLatticeABP:
         if self._kernel_offsets.numel() == 0 or self.params.epsilon == 0:
             return torch.zeros(B, M, device=self.device, dtype=self.dtype)
 
-        offsets = self._kernel_offsets.view(1, 1, -1, 2)
-        query = sites.to(device=self.device, dtype=torch.long).unsqueeze(2)
-        neighbor = (query + offsets) % self.grid_size
-        batch_idx = torch.arange(B, device=self.device).view(B, 1, 1).expand(
-            B, M, self._kernel_offsets.shape[0]
+        sites = sites.to(device=self.device, dtype=torch.long)
+        kernel_size = int(self._kernel_offsets.shape[0])
+        if batch_indices is None:
+            batch_indices = torch.arange(B, device=self.device)
+        batch_idx = batch_indices.view(B, 1, 1).expand(
+            B,
+            M,
+            kernel_size,
         )
-        occ = occupancy[
-            batch_idx,
-            neighbor[..., 0],
-            neighbor[..., 1],
-        ].to(dtype=self.dtype)
+        if self._neighbor_linear is not None:
+            linear_sites = (
+                sites[..., 0].remainder(self.grid_size) * self.grid_size
+                + sites[..., 1].remainder(self.grid_size)
+            )
+            neighbor_linear = self._neighbor_linear.index_select(
+                0,
+                linear_sites.reshape(-1),
+            ).view(B, M, kernel_size)
+            occupancy_flat = occupancy.view(B, -1)
+            occ = occupancy_flat[
+                batch_idx,
+                neighbor_linear,
+            ].to(dtype=self.dtype)
+        else:
+            offsets = self._kernel_offsets.view(1, 1, -1, 2)
+            query = sites.unsqueeze(2)
+            neighbor = (query + offsets) % self.grid_size
+            occ = occupancy[
+                batch_idx,
+                neighbor[..., 0],
+                neighbor[..., 1],
+            ].to(dtype=self.dtype)
         return torch.sum(occ * self._kernel_values.view(1, 1, -1), dim=-1)
 
     def potential_energy(self, sites: torch.Tensor, occupancy: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -351,24 +500,31 @@ class ThermodynamicLatticeABP:
 
     def _cv_factor(self, x: torch.Tensor) -> torch.Tensor:
         """Return ``x * exp(x) / sinh(x)`` with stable limiting forms."""
-        out = torch.zeros_like(x)
         finite = torch.isfinite(x)
-        xf = x[finite]
-        if xf.numel() == 0:
-            return out
+        safe_x = torch.where(finite, x, torch.zeros_like(x))
 
-        small = xf.abs() < 1.0e-5
-        large_pos = xf > 50.0
-        large_neg = xf < -50.0
-        mid = ~(small | large_pos | large_neg)
-
-        vals = torch.empty_like(xf)
-        vals[small] = 1.0 + xf[small] + xf[small] * xf[small] / 3.0
-        vals[large_pos] = 2.0 * xf[large_pos]
-        vals[large_neg] = -2.0 * xf[large_neg] * torch.exp(2.0 * xf[large_neg])
-        vals[mid] = 2.0 * xf[mid] / (-torch.expm1(-2.0 * xf[mid]))
-        out[finite] = vals
-        return out.clamp_min(0.0)
+        small_values = 1.0 + safe_x + safe_x * safe_x / 3.0
+        large_positive_values = 2.0 * safe_x
+        large_negative_values = (
+            -2.0 * safe_x * torch.exp(2.0 * safe_x)
+        )
+        mid_values = 2.0 * safe_x / (
+            -torch.expm1(-2.0 * safe_x)
+        )
+        values = torch.where(
+            safe_x.abs() < 1.0e-5,
+            small_values,
+            torch.where(
+                safe_x > 50.0,
+                large_positive_values,
+                torch.where(
+                    safe_x < -50.0,
+                    large_negative_values,
+                    mid_values,
+                ),
+            ),
+        )
+        return torch.where(finite, values, torch.zeros_like(values)).clamp_min(0.0)
 
     def _transition_probabilities_from_delta(
         self,
@@ -450,9 +606,54 @@ class ThermodynamicLatticeABP:
         propulsion = self.params.v0 * torch.stack(
             [torch.cos(theta_i), torch.sin(theta_i)], dim=-1
         )
-        active_work = torch.sum(propulsion.view(B, 1, 2) * self.dir_vectors.view(1, 4, 2), dim=-1)
+        active_work = torch.sum(
+            propulsion.view(B, 1, 2)
+            * self.dir_vectors.view(1, 4, 2),
+            dim=-1,
+        )
         probabilities = self._transition_probabilities_from_delta(active_work, delta_potential)
         return probabilities, new_sites, delta_potential, active_work
+
+    def _particle_probabilities_from_active_work(
+        self,
+        occupancy_without_particle: torch.Tensor,
+        old_sites: torch.Tensor,
+        active_work: torch.Tensor,
+        batch_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """GPU-friendly proposal calculation with one combined WCA gather."""
+        if batch_indices is None:
+            batch_indices = torch.arange(
+                old_sites.shape[0],
+                device=self.device,
+            )
+        new_sites = (
+            old_sites.unsqueeze(1) + self.dir_sites.view(1, 4, 2)
+        ) % self.grid_size
+        query_sites = torch.cat([old_sites.unsqueeze(1), new_sites], dim=1)
+        energies = self._local_wca_energy(
+            occupancy_without_particle,
+            query_sites,
+            batch_indices,
+        )
+        old_energy = energies[:, 0]
+        new_energy = energies[:, 1:]
+        occupied_destination = occupancy_without_particle[
+            batch_indices.view(-1, 1),
+            new_sites[..., 0],
+            new_sites[..., 1],
+        ] > 0
+        new_energy = torch.where(
+            occupied_destination,
+            torch.full_like(new_energy, float("inf")),
+            new_energy,
+        )
+        delta_potential = new_energy - old_energy.unsqueeze(1)
+        probabilities = self._transition_probabilities_from_delta(
+            active_work,
+            delta_potential,
+        )
+        return probabilities, new_sites, delta_potential
 
     def _check_probabilities(self, probabilities: torch.Tensor) -> None:
         p = self.params
@@ -483,6 +684,387 @@ class ThermodynamicLatticeABP:
     # Dynamics
     # ------------------------------------------------------------------
 
+    def _step_inplace_numba(
+        self,
+        sites: torch.Tensor,
+        theta: torch.Tensor,
+        occupancy: torch.Tensor,
+        *,
+        return_ep_map: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Advance one exact sweep with the fused CPU implementation."""
+        p = self.params
+        B, N, _ = sites.shape
+        order, draws = prepare_sweep_random_inputs(
+            N,
+            B,
+            dtype=self.dtype,
+            shuffle_particles=p.shuffle_particles,
+            legacy_call_order=False,
+        )
+        active_work = active_work_from_theta_vectorized(
+            theta,
+            self.dir_vectors,
+            p.v0,
+        )
+        diagnostics = numba_sweep_inplace(
+            sites,
+            occupancy,
+            order,
+            draws,
+            active_work,
+            self._kernel_offsets,
+            self._kernel_values,
+            dl=p.dl,
+            dt=p.dt,
+            reservoir_diffusion=p.Dt,
+            mobility=p.mobility,
+            prefactor=p.prefactor,
+            strict_probabilities=p.strict_probabilities,
+            probability_tolerance=p.probability_tolerance,
+            return_ep_map=return_ep_map,
+        )
+
+        # Generate angular noise only after a successful translational sweep,
+        # matching the reference RNG order exactly.
+        if p.Dr > 0:
+            theta_next = (
+                theta
+                + math.sqrt(2.0 * p.Dr * p.dt) * torch.randn_like(theta)
+            ) % (2.0 * math.pi)
+        else:
+            theta_next = theta
+        return sites, theta_next, occupancy, diagnostics
+
+    def _step_inplace_cuda_fused(
+        self,
+        sites: torch.Tensor,
+        theta: torch.Tensor,
+        occupancy: torch.Tensor,
+        *,
+        return_ep_map: bool,
+        check_probability_errors: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Advance one random-sequential sweep with the fused CUDA kernel."""
+        p = self.params
+        order, draws, active_work = prepare_cuda_sweep_inputs(
+            theta,
+            self.dir_vectors,
+            p.v0,
+            shuffle_particles=p.shuffle_particles,
+        )
+        diagnostics = cuda_sweep_inplace(
+            sites,
+            occupancy,
+            order,
+            draws,
+            active_work,
+            self._kernel_offsets,
+            self._kernel_values,
+            dl=p.dl,
+            dt=p.dt,
+            reservoir_diffusion=p.Dt,
+            mobility=p.mobility,
+            prefactor=p.prefactor,
+            strict_probabilities=p.strict_probabilities,
+            probability_tolerance=p.probability_tolerance,
+            return_ep_map=return_ep_map,
+            neighbor_linear=self._cuda_neighbor_linear,
+            status_check=(
+                "sync" if check_probability_errors else "none"
+            ),
+        )
+
+        # With immediate checking, rotational noise is sampled only after a
+        # valid translational sweep. Deferred runs mask the update on failure;
+        # that failed interval is discarded at the next save boundary.
+        if p.Dr > 0:
+            theta_candidate = (
+                theta
+                + math.sqrt(2.0 * p.Dr * p.dt) * torch.randn_like(theta)
+            ) % (2.0 * math.pi)
+            if check_probability_errors:
+                theta_next = theta_candidate
+            else:
+                theta_next = torch.where(
+                    diagnostics["backend_status"] == 0,
+                    theta_candidate,
+                    theta,
+                )
+        else:
+            theta_next = theta
+        return sites, theta_next, occupancy, diagnostics
+
+    def _step_inplace_torch_dense(
+        self,
+        sites: torch.Tensor,
+        theta: torch.Tensor,
+        occupancy: torch.Tensor,
+        *,
+        return_ep_map: bool = False,
+        order: Optional[torch.Tensor] = None,
+        draws: Optional[torch.Tensor] = None,
+        angular_noise: Optional[torch.Tensor] = None,
+        check_probability_errors: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Advance one sweep without CUDA-to-host work inside the particle loop.
+
+        This is the exact random-sequential algorithm used by the reference
+        Torch implementation, expressed with fixed-shape gathers, scatters, and
+        masks.  In particular, the particle axis is *not* parallelized: each
+        accepted hop is committed before the next particle is considered.
+
+        ``order``, ``draws``, and ``angular_noise`` are injectable so optimized
+        CUDA implementations can be compared against this path with identical
+        stochastic inputs.  Bulk RNG changes only the seeded CUDA stream
+        partitioning, not the transition law.
+        """
+        p = self.params
+        B, N, _ = sites.shape
+        batch_idx = torch.arange(B, device=self.device)
+
+        if order is None:
+            order = (
+                torch.randperm(N, device=self.device)
+                if p.shuffle_particles
+                else torch.arange(N, device=self.device)
+            )
+        else:
+            order = order.to(device=self.device, dtype=torch.long)
+            if order.shape != (N,):
+                raise ValueError(f"order must have shape ({N},).")
+
+        if draws is None:
+            draws = torch.rand(N, B, device=self.device, dtype=self.dtype)
+        else:
+            draws = draws.to(device=self.device, dtype=self.dtype)
+            if draws.shape != (N, B):
+                raise ValueError(f"draws must have shape ({N}, {B}).")
+
+        propulsion = p.v0 * torch.stack(
+            [torch.cos(theta), torch.sin(theta)],
+            dim=-1,
+        )
+        active_work_all = torch.sum(
+            propulsion.unsqueeze(2) * self.dir_vectors.view(1, 1, 4, 2),
+            dim=-1,
+        )
+
+        # Reorder once, then use a static Python loop index.  This keeps the
+        # random sequential dependency while avoiding scalar CUDA indices and
+        # the randperm(...).tolist() device synchronization.
+        ordered_sites = sites.index_select(1, order).contiguous()
+        ordered_active_work = active_work_all.index_select(1, order).contiguous()
+
+        total_ep = torch.zeros(B, device=self.device, dtype=self.dtype)
+        active_ep = torch.zeros_like(total_ep)
+        wca_ep = torch.zeros_like(total_ep)
+        accepted_hops = torch.zeros(B, device=self.device, dtype=torch.long)
+        ep_map = (
+            torch.zeros(
+                B,
+                self.grid_size,
+                self.grid_size,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            if return_ep_map
+            else None
+        )
+        ep_map_flat = ep_map.view(B, -1) if ep_map is not None else None
+
+        # Strict-probability failures are recorded on the device.  Valid
+        # trajectories therefore have no host synchronization in this loop.
+        # Once a failure is seen, later slots are evaluated but restored
+        # without committing a move; one error check is made after the sweep.
+        status = torch.zeros((), device=self.device, dtype=torch.int32)
+        bad_max_sum = torch.zeros((), device=self.device, dtype=self.dtype)
+        tolerance_limit = 1.0 + p.probability_tolerance
+
+        for slot in range(N):
+            old_sites = ordered_sites[:, slot].clone()
+            occupancy[
+                batch_idx,
+                old_sites[:, 0],
+                old_sites[:, 1],
+            ] -= 1
+            probabilities, new_sites, delta_v = (
+                self._particle_probabilities_from_active_work(
+                    occupancy,
+                    old_sites,
+                    ordered_active_work[:, slot],
+                    batch_idx,
+                )
+            )
+
+            any_nonfinite = ~torch.isfinite(probabilities).all()
+            if p.strict_probabilities:
+                # Sanitization is used only to keep the deferred-error path
+                # numerically well-defined.  A failed slot cannot commit.
+                sampling_probabilities = torch.nan_to_num(
+                    probabilities,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                probability_sum = sampling_probabilities.sum(dim=1)
+                max_sum = probability_sum.max()
+                bad_sum = (~any_nonfinite) & (max_sum > tolerance_limit)
+                step_status = torch.where(
+                    any_nonfinite,
+                    torch.ones_like(status),
+                    torch.where(
+                        bad_sum,
+                        torch.full_like(status, 2),
+                        torch.zeros_like(status),
+                    ),
+                )
+                was_valid = status == 0
+                bad_max_sum = torch.where(
+                    was_valid & bad_sum,
+                    max_sum,
+                    bad_max_sum,
+                )
+                status = torch.where(was_valid, step_status, status)
+                commit_allowed = status == 0
+            else:
+                sampling_probabilities = torch.nan_to_num(
+                    probabilities,
+                    nan=0.0,
+                    posinf=1.0,
+                    neginf=0.0,
+                )
+                probability_sum = sampling_probabilities.sum(dim=1)
+                max_sum = probability_sum.max()
+                scale = torch.clamp(
+                    1.0
+                    / probability_sum.clamp_min(
+                        torch.finfo(sampling_probabilities.dtype).eps
+                    ),
+                    max=1.0,
+                )
+                sampling_probabilities = torch.where(
+                    max_sum > tolerance_limit,
+                    sampling_probabilities * scale.unsqueeze(1),
+                    sampling_probabilities,
+                )
+                commit_allowed = torch.ones(
+                    (),
+                    device=self.device,
+                    dtype=torch.bool,
+                )
+
+            cumulative = torch.cumsum(sampling_probabilities, dim=1)
+            move_idx = (draws[slot].unsqueeze(1) > cumulative).sum(dim=1)
+            moved = (move_idx < 4) & commit_allowed
+            safe_dir = move_idx.clamp_max(3)
+
+            candidate_sites = new_sites[batch_idx, safe_dir]
+            chosen_sites = torch.where(
+                moved.unsqueeze(1),
+                candidate_sites,
+                old_sites,
+            )
+            chosen_delta_v = delta_v.gather(
+                1,
+                safe_dir.unsqueeze(1),
+            ).squeeze(1)
+            chosen_active = ordered_active_work[:, slot].gather(
+                1,
+                safe_dir.unsqueeze(1),
+            ).squeeze(1)
+
+            active_inc = torch.where(
+                moved,
+                chosen_active / p.Dt,
+                torch.zeros_like(chosen_active),
+            )
+            wca_inc = torch.where(
+                moved,
+                -(p.mobility * chosen_delta_v) / p.Dt,
+                torch.zeros_like(chosen_delta_v),
+            )
+            total_inc = active_inc + wca_inc
+
+            active_ep += active_inc
+            wca_ep += wca_inc
+            total_ep += total_inc
+            accepted_hops += moved.to(dtype=torch.long)
+
+            if ep_map_flat is not None:
+                departing_linear = (
+                    old_sites[:, 0] * self.grid_size + old_sites[:, 1]
+                )
+                ep_map_flat.scatter_add_(
+                    1,
+                    departing_linear.unsqueeze(1),
+                    total_inc.unsqueeze(1),
+                )
+
+            ordered_sites[:, slot] = chosen_sites
+            occupancy[
+                batch_idx,
+                chosen_sites[:, 0],
+                chosen_sites[:, 1],
+            ] += 1
+
+        sites.index_copy_(1, order, ordered_sites)
+
+        if p.strict_probabilities and check_probability_errors:
+            status_code = int(status.detach().cpu())
+            if status_code == 1:
+                raise ValueError(
+                    "Invalid lattice-MC probabilities: encountered non-finite "
+                    "values. Reduce dt, increase grid spacing, increase Dt, "
+                    "or use prefactor='cv'."
+                )
+            if status_code == 2:
+                max_sum_value = float(bad_max_sum.detach().cpu())
+                raise ValueError(
+                    "Invalid lattice-MC probabilities: total hop probability "
+                    f"reached {max_sum_value:.6g} > 1. Reduce dt, increase "
+                    "grid spacing, increase Dt, or use prefactor='cv'."
+                )
+
+        if p.Dr > 0:
+            if angular_noise is None:
+                angular_noise = torch.randn_like(theta)
+            else:
+                angular_noise = angular_noise.to(
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                if angular_noise.shape != theta.shape:
+                    raise ValueError(
+                        f"angular_noise must have shape {tuple(theta.shape)}."
+                    )
+            theta_candidate = (
+                theta
+                + math.sqrt(2.0 * p.Dr * p.dt) * angular_noise
+            ) % (2.0 * math.pi)
+            if p.strict_probabilities and not check_probability_errors:
+                theta_next = torch.where(
+                    status == 0,
+                    theta_candidate,
+                    theta,
+                )
+            else:
+                theta_next = theta_candidate
+        else:
+            theta_next = theta
+
+        diagnostics: Dict[str, torch.Tensor] = {
+            "medium_ep": total_ep,
+            "active_medium_ep": active_ep,
+            "wca_medium_ep": wca_ep,
+            "accepted_hops": accepted_hops,
+            "_probability_status": status,
+            "_probability_max_sum": bad_max_sum,
+        }
+        if ep_map is not None:
+            diagnostics["medium_ep_map"] = ep_map
+        return sites, theta_next, occupancy, diagnostics
+
     def _step_inplace(
         self,
         sites: torch.Tensor,
@@ -490,7 +1072,43 @@ class ThermodynamicLatticeABP:
         occupancy: torch.Tensor,
         *,
         return_ep_map: bool = False,
+        check_probability_errors: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        if (
+            self.backend == "numba"
+            and not (torch.is_grad_enabled() and theta.requires_grad)
+        ):
+            return self._step_inplace_numba(
+                sites,
+                theta,
+                occupancy,
+                return_ep_map=return_ep_map,
+            )
+
+        if (
+            self.backend == "cuda_fused"
+            and not (torch.is_grad_enabled() and theta.requires_grad)
+        ):
+            return self._step_inplace_cuda_fused(
+                sites,
+                theta,
+                occupancy,
+                return_ep_map=return_ep_map,
+                check_probability_errors=check_probability_errors,
+            )
+
+        if (
+            self.device.type == "cuda"
+            and not (torch.is_grad_enabled() and theta.requires_grad)
+        ):
+            return self._step_inplace_torch_dense(
+                sites,
+                theta,
+                occupancy,
+                return_ep_map=return_ep_map,
+                check_probability_errors=check_probability_errors,
+            )
+
         p = self.params
         B, N, _ = sites.shape
         batch_idx = torch.arange(B, device=self.device)
@@ -505,49 +1123,55 @@ class ThermodynamicLatticeABP:
             else None
         )
 
-        order = torch.randperm(N, device=self.device) if p.shuffle_particles else torch.arange(N, device=self.device)
-        for particle_idx_t in order:
-            particle_idx = int(particle_idx_t.detach().cpu())
+        order = (
+            torch.randperm(N, device=self.device).tolist()
+            if p.shuffle_particles
+            else range(N)
+        )
+        for particle_idx in order:
             old_sites = sites[:, particle_idx].clone()
             theta_i = theta[:, particle_idx]
-
             self._add_occupancy(occupancy, old_sites, -1)
-            probabilities, new_sites, delta_v, active_work = self._particle_probabilities_without_self(
-                occupancy,
-                old_sites,
-                theta_i,
+            probabilities, new_sites, delta_v, active_work = (
+                self._particle_probabilities_without_self(
+                    occupancy,
+                    old_sites,
+                    theta_i,
+                )
             )
             self._check_probabilities(probabilities)
 
-            prob_sum = probabilities.sum(dim=1).clamp(max=1.0)
             cumulative = torch.cumsum(probabilities, dim=1)
             draws = torch.rand(B, device=self.device, dtype=self.dtype)
             move_idx = (draws.unsqueeze(1) > cumulative).sum(dim=1)
             moved = move_idx < 4
 
+            moved_batches = batch_idx[moved]
+            moved_dirs = move_idx[moved]
             chosen_sites = old_sites.clone()
-            if moved.any():
-                moved_batches = batch_idx[moved]
-                moved_dirs = move_idx[moved]
-                chosen_sites[moved] = new_sites[moved_batches, moved_dirs]
+            chosen_sites[moved] = new_sites[moved_batches, moved_dirs]
 
-                chosen_delta_v = delta_v[moved_batches, moved_dirs]
-                chosen_active = active_work[moved_batches, moved_dirs]
-                active_inc = chosen_active / p.Dt
-                wca_inc = -(p.mobility * chosen_delta_v) / p.Dt
-                total_inc = active_inc + wca_inc
+            chosen_delta_v = delta_v[moved_batches, moved_dirs]
+            chosen_active = active_work[moved_batches, moved_dirs]
+            active_inc = chosen_active / p.Dt
+            wca_inc = -(p.mobility * chosen_delta_v) / p.Dt
+            total_inc = active_inc + wca_inc
 
-                active_ep[moved] += active_inc
-                wca_ep[moved] += wca_inc
-                total_ep[moved] += total_inc
-                accepted_hops[moved] += 1
+            active_ep[moved] += active_inc
+            wca_ep[moved] += wca_inc
+            total_ep[moved] += total_inc
+            accepted_hops[moved] += 1
 
-                if ep_map is not None:
-                    dep = old_sites[moved]
-                    ep_map[moved_batches, dep[:, 0], dep[:, 1]] += total_inc
-
+            departing_sites = old_sites[moved]
             sites[:, particle_idx] = chosen_sites
             self._add_occupancy(occupancy, chosen_sites, 1)
+
+            if ep_map is not None:
+                ep_map[
+                    moved_batches,
+                    departing_sites[:, 0],
+                    departing_sites[:, 1],
+                ] += total_inc
 
         if p.Dr > 0:
             theta_next = theta + math.sqrt(2.0 * p.Dr * p.dt) * torch.randn_like(theta)
@@ -579,12 +1203,23 @@ class ThermodynamicLatticeABP:
             sites = sites.unsqueeze(0)
         if theta.dim() == 1:
             theta = theta.unsqueeze(0)
-        sites_work = sites.to(device=self.device, dtype=torch.long).clone() % self.grid_size
-        theta_work = theta.to(device=self.device, dtype=self.dtype).clone()
+        sites_work = (
+            sites.to(device=self.device, dtype=torch.long).clone()
+            % self.grid_size
+        ).contiguous()
+        theta_work = (
+            theta.to(device=self.device, dtype=self.dtype)
+            .clone()
+            .contiguous()
+        )
         if occupancy is None:
             occupancy_work = self.occupancy_from_sites(sites_work)
         else:
-            occupancy_work = occupancy.to(device=self.device, dtype=torch.long).clone()
+            occupancy_work = (
+                occupancy.to(device=self.device, dtype=torch.long)
+                .clone()
+                .contiguous()
+            )
 
         sites_next, theta_next, occupancy_next, diagnostics = self._step_inplace(
             sites_work,
@@ -636,10 +1271,84 @@ class ThermodynamicLatticeABP:
 
         occupancy = self.occupancy_from_sites(sites)
 
+        # The CUDA implementations report probability failures through device
+        # scalars. During a long simulation, checking those scalars only at a
+        # save boundary avoids one forced device synchronization per sweep.
+        # On failure the interval's internal state is discarded when the
+        # exception is raised; successful dynamics are unchanged.
+        defer_cuda_probability_checks = self.device.type == "cuda"
+        pending_probability_checks = []
+
+        def record_probability_check(
+            step_diagnostics: Dict[str, torch.Tensor],
+        ) -> None:
+            if not defer_cuda_probability_checks:
+                return
+            if "backend_status" in step_diagnostics:
+                pending_probability_checks.append(
+                    (
+                        step_diagnostics["backend_status"],
+                        step_diagnostics["backend_bad_max_sum"],
+                    )
+                )
+            elif "_probability_status" in step_diagnostics:
+                pending_probability_checks.append(
+                    (
+                        step_diagnostics["_probability_status"],
+                        step_diagnostics["_probability_max_sum"],
+                    )
+                )
+
+        def flush_probability_checks() -> None:
+            if not pending_probability_checks:
+                return
+            status_values = torch.stack(
+                [item[0] for item in pending_probability_checks]
+            ).detach().cpu()
+            failure_indices = torch.nonzero(
+                status_values != 0,
+                as_tuple=False,
+            )
+            if failure_indices.numel() == 0:
+                pending_probability_checks.clear()
+                return
+
+            failure_index = int(failure_indices[0, 0])
+            status_code = int(status_values[failure_index])
+            bad_sum_tensor = pending_probability_checks[failure_index][1]
+            pending_probability_checks.clear()
+            if status_code == 1:
+                raise ValueError(
+                    "Invalid lattice-MC probabilities: encountered non-finite "
+                    "values during a CUDA simulation interval. Reduce dt, "
+                    "increase grid spacing, increase Dt, or use "
+                    "prefactor='cv'."
+                )
+            if status_code == 2:
+                max_sum_value = float(bad_sum_tensor.detach().cpu())
+                raise ValueError(
+                    "Invalid lattice-MC probabilities: total hop probability "
+                    f"reached {max_sum_value:.6g} > 1 during a CUDA "
+                    "simulation interval. Reduce dt, increase grid spacing, "
+                    "increase Dt, or use prefactor='cv'."
+                )
+            raise RuntimeError(
+                f"Unexpected CUDA probability status {status_code}."
+            )
+
         burn_iter = trange(burn_in, desc="Lattice ABP burn-in", leave=False) if show_progress else range(burn_in)
         with torch.no_grad():
-            for _ in burn_iter:
-                sites, theta, occupancy, _ = self._step_inplace(sites, theta, occupancy)
+            for burn_idx in burn_iter:
+                sites, theta, occupancy, burn_diag = self._step_inplace(
+                    sites,
+                    theta,
+                    occupancy,
+                    check_probability_errors=not defer_cuda_probability_checks,
+                )
+                record_probability_check(burn_diag)
+                if (burn_idx + 1) % save_interval == 0:
+                    flush_probability_checks()
+            flush_probability_checks()
 
         n_saved = n_steps // save_interval + 1
         sites_traj = torch.empty(n_saved, B, self.N, 2, dtype=torch.long, device=self.device)
@@ -669,13 +1378,20 @@ class ThermodynamicLatticeABP:
             )
 
         diag: Dict[str, torch.Tensor] = {}
-        diagnostics_enabled = save_diagnostics or save_exact_medium_ep
-        if diagnostics_enabled:
-            diag = {
-                "potential": torch.empty(n_saved, B, dtype=self.dtype, device=self.device),
-            }
-            if save_exact_medium_ep:
-                diag["accepted_hops"] = torch.empty(B, n_saved - 1, dtype=torch.long, device=self.device)
+        if save_diagnostics:
+            diag["potential"] = torch.empty(
+                n_saved,
+                B,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        if save_exact_medium_ep:
+            diag["accepted_hops"] = torch.empty(
+                B,
+                n_saved - 1,
+                dtype=torch.long,
+                device=self.device,
+            )
 
         exact_medium_ep = None
         exact_active_ep = None
@@ -715,7 +1431,7 @@ class ThermodynamicLatticeABP:
                 occupancy_traj[save_idx] = occupancy
             if fields is not None:
                 fields[save_idx] = fieldizer.encode(pos, theta)
-            if diagnostics_enabled:
+            if save_diagnostics:
                 diag["potential"][save_idx] = self.potential_energy(sites, occupancy)
 
         save_idx = 0
@@ -732,7 +1448,12 @@ class ThermodynamicLatticeABP:
                         theta,
                         occupancy,
                         return_ep_map=save_exact_medium_ep and save_ep_maps,
+                        check_probability_errors=(
+                            not defer_cuda_probability_checks
+                        ),
                     )
+                    record_probability_check(step_diag)
+                    next_step = step_idx + 1
                     if save_exact_medium_ep:
                         interval_total_ep += step_diag["medium_ep"]
                         interval_active_ep += step_diag["active_medium_ep"]
@@ -741,15 +1462,13 @@ class ThermodynamicLatticeABP:
                         if interval_ep_map is not None:
                             interval_ep_map += step_diag["medium_ep_map"]
 
-                        next_step = step_idx + 1
                         if next_step % save_interval == 0:
                             interval_idx = next_step // save_interval - 1
                             if interval_idx < exact_medium_ep.shape[1]:
                                 exact_medium_ep[:, interval_idx] = interval_total_ep
                                 exact_active_ep[:, interval_idx] = interval_active_ep
                                 exact_wca_ep[:, interval_idx] = interval_wca_ep
-                                if diagnostics_enabled:
-                                    diag["accepted_hops"][:, interval_idx] = interval_hops
+                                diag["accepted_hops"][:, interval_idx] = interval_hops
                                 if ep_maps is not None and interval_ep_map is not None:
                                     ep_maps[interval_idx] = interval_ep_map
 
@@ -759,6 +1478,9 @@ class ThermodynamicLatticeABP:
                             interval_hops.zero_()
                             if interval_ep_map is not None:
                                 interval_ep_map.zero_()
+                    if next_step % save_interval == 0:
+                        flush_probability_checks()
+            flush_probability_checks()
 
         out = {
             "sites": sites_traj.cpu(),
@@ -801,7 +1523,13 @@ class ThermodynamicLatticeABP:
                 out += torch.roll(rolled_x, shifts=-dy, dims=-1)
         return out / float(box * box)
 
-    def mips_summary(self, occupancy: torch.Tensor, coarse_box: int = 8) -> Dict[str, float]:
+    def mips_summary(
+        self,
+        occupancy: torch.Tensor,
+        coarse_box: int = 8,
+        *,
+        include_coarse: bool = False,
+    ) -> Dict[str, float]:
         """Return compact MIPS indicators for the first ensemble in a snapshot."""
         if occupancy.dim() == 3:
             occ = occupancy[0]
@@ -812,9 +1540,6 @@ class ThermodynamicLatticeABP:
 
         occ_cpu = occ.detach().cpu().numpy().astype(np.float64)
         rho = float(occ_cpu.mean())
-        coarse = self.coarse_density(torch.as_tensor(occ_cpu, device=self.device), box=coarse_box)
-        coarse_np = coarse.detach().cpu().numpy()
-        random_std = math.sqrt(max(rho * (1.0 - rho), 0.0) / float(coarse_box * coarse_box))
 
         centered = occ_cpu - rho
         spectrum = np.abs(np.fft.fftshift(np.fft.fft2(centered))) ** 2
@@ -826,23 +1551,38 @@ class ThermodynamicLatticeABP:
         low_mean = float(spectrum[low].mean()) if np.any(low) else 0.0
         mid_mean = float(spectrum[mid].mean()) if np.any(mid) else 0.0
 
+        summary = {
+            "site_density": rho,
+            "packing_fraction": self.params.phi,
+            "largest_site_cluster_fraction": self._largest_cluster_fraction_np(occ_cpu),
+            "low_k_ratio": low_mean / (mid_mean + 1.0e-12),
+        }
+        if not include_coarse:
+            return summary
+
+        coarse = self.coarse_density(
+            torch.as_tensor(occ_cpu, device=self.device),
+            box=coarse_box,
+        )
+        coarse_np = coarse.detach().cpu().numpy()
+        random_std = math.sqrt(
+            max(rho * (1.0 - rho), 0.0)
+            / float(coarse_box * coarse_box)
+        )
         coarse_2d = coarse_np[0] if coarse_np.ndim == 3 else coarse_np
         dense_threshold = rho + random_std
         dense_domains = coarse_2d >= dense_threshold
 
-        return {
-            "site_density": rho,
-            "packing_fraction": self.params.phi,
+        summary.update({
             "coarse_std": float(coarse_2d.std()),
             "coarse_std_random": random_std,
             "coarse_std_ratio": float(coarse_2d.std() / (random_std + 1.0e-12)),
             "coarse_q10": float(np.quantile(coarse_2d, 0.10)),
             "coarse_q90": float(np.quantile(coarse_2d, 0.90)),
-            "largest_site_cluster_fraction": self._largest_cluster_fraction_np(occ_cpu),
             "dense_area_fraction": float(dense_domains.mean()),
             "largest_dense_domain_fraction": self._largest_cluster_fraction_np(dense_domains),
-            "low_k_ratio": low_mean / (mid_mean + 1.0e-12),
-        }
+        })
+        return summary
 
     def particle_cluster_fraction(
         self,
@@ -888,12 +1628,17 @@ class ThermodynamicLatticeABP:
         sites: torch.Tensor,
         *,
         coarse_box: int = 8,
+        include_coarse: bool = False,
         cluster_distance: Optional[float] = None,
         ensemble_idx: int = 0,
     ) -> Dict[str, float]:
         """Return MIPS indicators from particle sites for one ensemble."""
         occupancy = self.occupancy_from_sites(sites)
-        summary = self.mips_summary(occupancy[ensemble_idx], coarse_box=coarse_box)
+        summary = self.mips_summary(
+            occupancy[ensemble_idx],
+            coarse_box=coarse_box,
+            include_coarse=include_coarse,
+        )
         summary["particle_largest_cluster_fraction"] = self.particle_cluster_fraction(
             sites,
             cluster_distance=cluster_distance,

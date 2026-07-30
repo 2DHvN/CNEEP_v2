@@ -1,0 +1,11 @@
+# General project environment. For the L40S lattice-ABP notebook, use
+# data/lattice_abp_tc/requirements-l40s.txt and install CUDA PyTorch separately.
+torch>=2.0
+numpy>=1.24
+numba>=0.60
+ninja>=1.11
+matplotlib>=3.7
+seaborn>=0.13
+tqdm>=4.66
+ipywidgets>=8.0
+pandas>=2.2

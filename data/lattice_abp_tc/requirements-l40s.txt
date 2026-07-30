@@ -1,0 +1,8 @@
+# PyTorch is installed separately with the CUDA wheel selected at
+# https://pytorch.org/get-started/locally/
+numpy>=1.24
+matplotlib>=3.7
+tqdm>=4.66
+ninja>=1.11
+setuptools>=68
+ipykernel>=6.29
