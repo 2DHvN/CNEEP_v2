@@ -287,9 +287,12 @@ def _make_sweep_kernel(float_type):
                         cumulative
                         + probabilities[batch_index, direction]
                     )
+                    # torch.rand draws from [0, 1), so inverse-CDF bins are
+                    # half-open and the selected CDF value must be strictly
+                    # larger than the draw.  This skips leading zero-mass bins.
                     if (
                         selected_direction == 4
-                        and draw <= cumulative
+                        and draw < cumulative
                     ):
                         selected_direction = direction
 

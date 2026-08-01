@@ -955,7 +955,11 @@ class ThermodynamicLatticeABP:
                 )
 
             cumulative = torch.cumsum(sampling_probabilities, dim=1)
-            move_idx = (draws[slot].unsqueeze(1) > cumulative).sum(dim=1)
+            # Inverse-CDF intervals are half-open: [previous, cumulative).
+            # ``torch.rand`` can return exactly zero, so using ``>`` here can
+            # select a leading zero-probability direction.  Count every CDF
+            # boundary that is less than or equal to the draw instead.
+            move_idx = (draws[slot].unsqueeze(1) >= cumulative).sum(dim=1)
             moved = (move_idx < 4) & commit_allowed
             safe_dir = move_idx.clamp_max(3)
 
@@ -1143,7 +1147,9 @@ class ThermodynamicLatticeABP:
 
             cumulative = torch.cumsum(probabilities, dim=1)
             draws = torch.rand(B, device=self.device, dtype=self.dtype)
-            move_idx = (draws.unsqueeze(1) > cumulative).sum(dim=1)
+            # Use the first strictly larger CDF value.  This skips zero-mass
+            # directions even when the uniform draw is exactly zero.
+            move_idx = (draws.unsqueeze(1) >= cumulative).sum(dim=1)
             moved = move_idx < 4
 
             moved_batches = batch_idx[moved]

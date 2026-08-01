@@ -378,7 +378,9 @@ __global__ __launch_bounds__(kThreadCount) void lattice_abp_sweep_global_kernel(
       for (int direction = 0; direction < kDirectionCount; ++direction) {
         cumulative +=
             probabilities[batch_index * kDirectionCount + direction];
-        if (selected_direction == kDirectionCount && draw <= cumulative) {
+        // Draws are in [0, 1): choose the first CDF value strictly above the
+        // draw so a leading zero-probability direction cannot be selected.
+        if (selected_direction == kDirectionCount && draw < cumulative) {
           selected_direction = direction;
         }
       }
@@ -618,7 +620,8 @@ void lattice_abp_sweep_strict_batched_kernel(
       const scalar_t draw = draws[order_index * batch_size + batch_index];
       for (int direction = 0; direction < kDirectionCount; ++direction) {
         cumulative += probabilities[probability_base + direction];
-        if (selected_direction == kDirectionCount && draw <= cumulative) {
+        // Keep the same half-open inverse-CDF convention as the strict kernel.
+        if (selected_direction == kDirectionCount && draw < cumulative) {
           selected_direction = direction;
         }
       }
