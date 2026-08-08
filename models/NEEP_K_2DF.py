@@ -310,6 +310,23 @@ class MultiScaleK_2DF(nn.Module):
         self.max_distance = opt.max_distance
 
         self.n_components = getattr(opt, "n_components", 1)
+        # Input components may contain contextual observables that should not
+        # themselves enter the final force·increment contraction.  By default
+        # retain the historical behaviour and contract every component.
+        component_indices = getattr(
+            opt, "ep_component_indices", tuple(range(self.n_components))
+        )
+        self.ep_component_indices = tuple(int(index) for index in component_indices)
+        if not self.ep_component_indices:
+            raise ValueError("ep_component_indices must contain at least one component.")
+        if len(set(self.ep_component_indices)) != len(self.ep_component_indices):
+            raise ValueError("ep_component_indices must not contain duplicates.")
+        if any(index < 0 or index >= self.n_components for index in self.ep_component_indices):
+            raise ValueError(
+                f"ep_component_indices={self.ep_component_indices} is invalid "
+                f"for n_components={self.n_components}."
+            )
+        self.n_ep_components = len(self.ep_component_indices)
         in_channels = opt.seq_len * self.n_components + (2 if opt.positional else 0)
         hidden_channels = opt.n_channel
         n_hidden = getattr(opt, "n_hidden", 2)
@@ -327,7 +344,7 @@ class MultiScaleK_2DF(nn.Module):
                 in_channels=in_channels,
                 hidden_channels=hidden_channels,
                 n_hidden=n_hidden,
-                n_components=self.n_components,
+                n_components=self.n_ep_components,
                 kernel_geometry=self.k_kernel_geometry,
                 shell_width=self.shell_width,
                 shell_offset=self.shell_offset,
@@ -376,8 +393,9 @@ class MultiScaleK_2DF(nn.Module):
             x_ = x.reshape(B, S * C, Lx, Ly)
             _x = torch.flip(x, [1]).reshape(B, S * C, Lx, Ly)
             
-            # Extract displacement vector
-            dx = x[:, 1, :, :, :] - x[:, 0, :, :, :]  # [B, C, Lx, Ly]
+            # Use the configured generalized increments in the final
+            # contraction.  All input components remain available to infer A.
+            dx = x[:, 1, self.ep_component_indices, :, :] - x[:, 0, self.ep_component_indices, :, :]
             _dx = -dx                                 # Time reversed displacement
         else:
             # Time-forward and time-reversed inputs
