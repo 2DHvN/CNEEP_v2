@@ -4,6 +4,47 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def kneep_spatial_mean_score(branch_maps: torch.Tensor) -> torch.Tensor:
+    """Return the intensive NEEP score used by the training objective.
+
+    ``branch_maps`` has shape ``[B, K, Lx, Ly]``.  Training follows
+    ``utils.train``/``utils.validate``: average over space first, then sum the
+    branch contributions.  The saved-frame time interval is already encoded
+    in the transition and must not be divided out here.
+    """
+    if branch_maps.ndim != 4:
+        raise ValueError(f"Expected branch maps [B,K,Lx,Ly], got {tuple(branch_maps.shape)}")
+    return branch_maps.mean(dim=(-2, -1)).sum(dim=1)
+
+
+def kneep_local_ep_increment(branch_maps: torch.Tensor) -> torch.Tensor:
+    """Sum branches and return the local EP increment map ``[B,Lx,Ly]``."""
+    if branch_maps.ndim != 4:
+        raise ValueError(f"Expected branch maps [B,K,Lx,Ly], got {tuple(branch_maps.shape)}")
+    return branch_maps.sum(dim=1)
+
+
+def kneep_total_ep_increment(
+    branch_maps: torch.Tensor,
+    cell_area: float = 1.0,
+) -> torch.Tensor:
+    """Integrate local EP increments over space, following ``utils.validate``."""
+    local_map = kneep_local_ep_increment(branch_maps)
+    return local_map.sum(dim=(-2, -1)) * float(cell_area)
+
+
+def kneep_total_from_spatial_mean(
+    branch_scores: torch.Tensor,
+    spatial_shape,
+    cell_area: float = 1.0,
+) -> torch.Tensor:
+    """Convert ``model(x)`` spatial means to total EP increments."""
+    if branch_scores.ndim != 2:
+        raise ValueError(f"Expected branch scores [B,K], got {tuple(branch_scores.shape)}")
+    lx, ly = (int(spatial_shape[0]), int(spatial_shape[1]))
+    return branch_scores.sum(dim=1) * (lx * ly) * float(cell_area)
+
 # ──────────────────────────────────────────────────────────────
 # Periodic padding for 2D inputs
 # ──────────────────────────────────────────────────────────────
@@ -383,9 +424,13 @@ class MultiScaleK_2DF(nn.Module):
         Returns
         -------
         If return_maps is False:
-            J : [B, K+1]  where J[:, k] is the estimated EP at distance k.
+            J : [B, K+1], the spatial mean of each branch's local EP
+                increment map.  This is the intensive score used for stable
+                NEEP training; integrate it over space only when reporting a
+                total EP increment.
         If return_maps is True:
-            maps : [B, K+1, Lx, Ly] where maps[:, k, :, :] is the local EP map at distance k.
+            maps : [B, K+1, Lx, Ly] where maps[:, k, :, :] is the local EP
+                   increment map at distance k.  No dt division is applied.
         """
         if self.n_components > 1:
             # x is [B, seq_len, C, Lx, Ly]
