@@ -1,7 +1,7 @@
 # Thermodynamically consistent lattice ABP
 
 이 디렉터리는 주기 경계를 갖는 2차원 square lattice에서 active Brownian
-particles(ABP)를 random-sequential 방식으로 적분한다. 병진 hop은 local detailed
+particles(ABP)를 5-color sublattice 방식으로 적분한다. 병진 hop은 local detailed
 balance를 만족하도록 구성하고, 수락된 각 hop의 microscopic medium entropy
 production(EP)을 정확히 누적한다.
 
@@ -125,28 +125,24 @@ $$
 
 ## 한 simulation step
 
-한 step은 모든 입자를 한 번씩 갱신하는 sweep과 한 번의 angular Brownian
-update로 구성된다.
+한 step은 5개의 color substep과 한 번의 angular Brownian update로 구성된다.
 
 ```text
-order <- random permutation of 0,...,N-1
-u[N,B] <- uniform random numbers
-
-for particle i in order:                 # particle 축은 순차 실행
-    occupancy에서 i를 잠시 제거
-    네 목적지의 Delta V, active work, p_d 계산
-    inverse CDF로 hop 방향 또는 stay 선택
-    accepted hop의 EP를 departure site에 누적
-    선택된 위치를 occupancy에 즉시 반영
+for colour c in 0,...,4:
+    selected <- particles at (x + 3y) mod 5 == c
+    selected 모두에 대해 동일한 pre-substep occupancy에서 Delta V, p_d 계산
+    inverse CDF로 selected의 hop 또는 stay를 독립 선택
+    selected 결과를 한 번에 commit
+    다음 colour 전에 새 occupancy에서 WCA를 다시 계산
 
 theta <- (theta + sqrt(2 Dr dt) * Normal(0,1)) mod 2 pi
 ```
 
-한 입자의 이동은 다음 입자의 확률을 계산하기 전에 commit된다. 따라서 particle
-축을 동시에 갱신하는 synchronous cellular automaton이 아니다. `B` replicas는
-서로 다른 초기 상태, uniform draw, angular noise를 갖지만 한 sweep의 particle
-permutation은 batch 전체가 공유한다. 최종 error bar에는 별도 seed group으로
-production을 반복하는 것이 안전하다.
+같은 colour의 cardinal-neighbor site는 존재하지 않으므로 hard-core destination
+충돌 없이 동시에 commit할 수 있다. `B` replicas는 서로 다른 초기 상태와 난수를
+갖는다. finite-range WCA에서 동시에 발생한 두 hop의 joint energy change는
+single-particle rate에 포함되지 않는 finite-`dt` 효과가 있으므로, 해석과 검증
+범위는 [`technial_report.md`](technial_report.md)를 따른다.
 
 ## exact medium EP와 local map
 
@@ -192,19 +188,14 @@ burn-in EP는 반환하지 않는다.
 | backend | 역할 |
 |---|---|
 | `torch` | library reference/default; CPU 또는 fixed-shape Torch CUDA |
-| `numba` | CPU fused random-sequential sweep |
-| `cuda_fused` | JIT CUDA extension; L40S production 경로 |
-| `auto` | CUDA에서는 fused 우선 후 Torch fallback, CPU에서는 Numba 우선 |
+| `numba` | legacy CPU random-sequential backend; 5-color에서는 사용하지 않음 |
+| `cuda_fused` | legacy random-sequential extension; 5-color에서는 Torch로 해석됨 |
+| `auto` | 5-color에서는 Torch로 해석됨 |
 
-모든 backend는 같은 transition probability, random-sequential commit 순서,
-EP 정의를 사용한다. CUDA fused kernel은 ensemble/WCA stencil 계산을 병렬화하지만
-한 ensemble 안의 particle update dependency는 유지한다. RNG batching과 장치별
-floating-point reduction 때문에 같은 seed가 backend 사이의 bitwise-identical
-trajectory를 보장하지는 않는다.
-
-`backend="cuda_fused"`를 명시하면 CUDA extension을 사용할 수 없을 때 fallback하지
-않고 실패한다. CUDA/C++ source를 수정한 뒤에는 이미 load된 extension이 Python
-process 안에 남아 있으므로 **Jupyter kernel을 재시작해야 한다**.
+5-color 설정에서는 Torch CPU/CUDA tensor path가 transition probability와
+5-colour commit 순서를 담당한다. legacy CUDA fused kernel은 random-sequential
+규칙을 구현하므로 사용하지 않는다. CUDA에서 5-color를 실행하려면
+`device="cuda:0", backend="torch"`를 사용한다.
 
 ## 현재 KNEEP/MIPS state point
 
@@ -220,7 +211,7 @@ process 안에 남아 있으므로 **Jupyter kernel을 재시작해야 한다**.
 | `v0`, `Dr`, `Dt` | `50`, `1.5`, `1` |
 | `Pe_r = v0/(Dr*sigma)` | `66.667` |
 | `dt`, `prefactor` | `1e-4`, `cv` |
-| backend, dtype, seed | `cuda_fused`, `float32`, `7` |
+| backend, dtype, seed | `torch`, `float32`, `7` |
 | run | `B=101`, burn-in `100,000`, production `100,000` |
 | saving | every `100` steps: 1,001 frames/1,000 intervals |
 | split | train `80`, validation `20`, test `1` replicas |
@@ -269,6 +260,11 @@ source 수정 전 trajectory를 자동으로 재사용하지 않는다.
 
 ## 최소 사용 예
 
+Google Colab에서는 [mips_demo_colab.ipynb](mips_demo_colab.ipynb)를 사용한다.
+Colab GPU runtime에서 Google Drive의 `MyDrive/CNEEP_v2`에 현재 repository를
+복사한 뒤 실행하면 된다. 이 notebook은 legacy CUDA extension을 빌드하지 않고
+5-color Torch CUDA path를 사용한다.
+
 ```python
 from data.lattice_abp_tc import (
     ThermodynamicLatticeABP,
@@ -291,7 +287,7 @@ params = ThermodynamicLatticeABPParams(
     seed=7,
     device="cuda",
     dtype="float32",
-    backend="cuda_fused",
+    backend="torch",
 )
 sim = ThermodynamicLatticeABP(params)
 result = sim.simulate(

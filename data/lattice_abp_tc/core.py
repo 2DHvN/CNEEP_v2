@@ -81,6 +81,10 @@ class ThermodynamicLatticeABPParams:
     strict_probabilities: bool = True
     probability_tolerance: float = 1.0e-6
     shuffle_particles: bool = True
+    # Translation is advanced in five non-neighbouring lattice colours, as in
+    # the reference implementation accompanying Kim, Kwon, and Baek.  A
+    # colour is committed synchronously; colours themselves are sequential.
+    update_scheme: str = "five_color"
 
     # initialization and reproducibility
     initial_min_distance: Optional[float] = None
@@ -135,8 +139,8 @@ class ThermodynamicLatticeABPParams:
 class ThermodynamicLatticeABP:
     """Discrete-space ABP simulator with thermodynamically consistent hops.
 
-    A single Monte Carlo step is one random sequential sweep through all
-    particles followed by an exact angular Brownian update.  Each accepted hop
+    A single Monte Carlo step is five synchronous colour substeps followed by
+    one angular Brownian update.  Each accepted hop
     contributes the true medium entropy production
 
     ``Delta S_med = (v dot Delta r - mobility * Delta V) / Dt``,
@@ -214,6 +218,8 @@ class ThermodynamicLatticeABP:
             raise ValueError("Dr must be nonnegative and dt must be positive.")
         if p.prefactor.lower() not in {"c0", "cv"}:
             raise ValueError("prefactor must be 'c0' or 'cv'.")
+        if p.update_scheme.lower() != "five_color":
+            raise ValueError("Only update_scheme='five_color' is supported.")
         if p.backend.lower() not in {
             "auto",
             "cuda_fused",
@@ -225,9 +231,25 @@ class ThermodynamicLatticeABP:
             )
         if p.N > p.grid_size * p.grid_size:
             raise ValueError("N cannot exceed the number of lattice sites.")
+        # c(x,y) = x + 3 y (mod 5) assigns distinct colours to periodic
+        # cardinal neighbours iff G is not 1 modulo 5.
+        if p.grid_size % 5 == 1:
+            raise ValueError(
+                "five_color requires grid_size % 5 != 1 so periodic "
+                "nearest neighbours have distinct colours."
+            )
 
     def _resolve_backend(self, backend: str) -> str:
         normalized = backend.lower()
+        if self.params.update_scheme == "five_color":
+            if normalized in {"numba", "cuda_fused", "auto"}:
+                warnings.warn(
+                    "five_color uses the Torch tensor implementation; the "
+                    "legacy Numba/CUDA fused backends implement a different "
+                    "random-sequential update law.",
+                    stacklevel=2,
+                )
+            return "torch"
         if normalized == "auto":
             if self.device.type == "cuda":
                 if cuda_backend_buildable():
@@ -655,6 +677,81 @@ class ThermodynamicLatticeABP:
         )
         return probabilities, new_sites, delta_potential
 
+    def _colour_batch_probabilities(
+        self,
+        occupancy: torch.Tensor,
+        sites: torch.Tensor,
+        active_work: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate all particles' four proposals from one frozen state.
+
+        ``sites`` has shape ``[B, N, 2]`` and the returned probability and
+        energy tensors have shape ``[B, N, 4]``.  The WCA gather is flattened
+        over both particle and candidate axes, so an arbitrary precomputed
+        stencil size remains fully batched.
+        """
+        B, N, _ = sites.shape
+        new_sites = (
+            sites.unsqueeze(2) + self.dir_sites.view(1, 1, 4, 2)
+        ).remainder(self.grid_size)
+        old_energy = self._local_wca_energy(occupancy, sites)
+        if self._kernel_offsets.numel() == 0 or self.params.epsilon == 0:
+            new_energy = torch.zeros(B, N, 4, device=self.device, dtype=self.dtype)
+        else:
+            # Mask the candidate particle's old site before summation.  This
+            # is algebraically equivalent to removing that particle from
+            # occupancy, but avoids float32 cancellation for steep WCA cores.
+            kernel_size = int(self._kernel_offsets.shape[0])
+            old_linear = (sites[..., 0] * self.grid_size + sites[..., 1]).unsqueeze(-1)
+            batch_idx = torch.arange(B, device=self.device).view(B, 1, 1, 1)
+            occupancy_flat = occupancy.view(B, -1)
+            if self._neighbor_linear is not None:
+                candidate_linear = (
+                    new_sites[..., 0] * self.grid_size + new_sites[..., 1]
+                )
+                neighbor_linear = self._neighbor_linear.index_select(
+                    0, candidate_linear.reshape(-1)
+                ).view(B, N, 4, kernel_size)
+                neighbour_occ = occupancy_flat[batch_idx, neighbor_linear]
+                self_mask = neighbor_linear == old_linear.unsqueeze(-1)
+            else:
+                neighbour = (
+                    new_sites.unsqueeze(-2)
+                    + self._kernel_offsets.view(1, 1, 1, kernel_size, 2)
+                ).remainder(self.grid_size)
+                neighbour_occ = occupancy[
+                    batch_idx,
+                    neighbour[..., 0],
+                    neighbour[..., 1],
+                ]
+                neighbor_linear = (
+                    neighbour[..., 0] * self.grid_size + neighbour[..., 1]
+                )
+                self_mask = neighbor_linear == old_linear.unsqueeze(-1)
+            new_energy = torch.sum(
+                torch.where(self_mask, torch.zeros_like(neighbour_occ), neighbour_occ)
+                .to(self.dtype)
+                * self._kernel_values.view(1, 1, 1, kernel_size),
+                dim=-1,
+            )
+        batch_idx = torch.arange(B, device=self.device).view(B, 1, 1)
+        occupied_destination = occupancy[
+            batch_idx,
+            new_sites[..., 0],
+            new_sites[..., 1],
+        ] > 0
+        new_energy = torch.where(
+            occupied_destination,
+            torch.full_like(new_energy, float("inf")),
+            new_energy,
+        )
+        delta_potential = new_energy - old_energy.unsqueeze(-1)
+        probabilities = self._transition_probabilities_from_delta(
+            active_work,
+            delta_potential,
+        )
+        return probabilities, new_sites, delta_potential
+
     def _check_probabilities(self, probabilities: torch.Tensor) -> None:
         p = self.params
         if not torch.isfinite(probabilities).all():
@@ -1069,6 +1166,123 @@ class ThermodynamicLatticeABP:
             diagnostics["medium_ep_map"] = ep_map
         return sites, theta_next, occupancy, diagnostics
 
+    def _step_inplace_five_color(
+        self,
+        sites: torch.Tensor,
+        theta: torch.Tensor,
+        occupancy: torch.Tensor,
+        *,
+        return_ep_map: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        """Advance one step as five synchronous coloured substeps.
+
+        The colour is ``(x + 3*y) % 5``.  A substep first evaluates every
+        proposal from one frozen occupancy field, then commits that colour as
+        a batch.  Consequently an occupied destination is never selected and
+        no two cardinal hops of the same colour share a destination.  WCA
+        proposal energies are recomputed from the newly committed occupancy
+        before every subsequent colour.
+
+        This is intentionally a Torch implementation even on CUDA.  The old
+        Numba/CUDA fused backends encode random-sequential particle sweeps and
+        must not be used for this different transition kernel.
+        """
+        p = self.params
+        B, N, _ = sites.shape
+
+        propulsion = p.v0 * torch.stack([torch.cos(theta), torch.sin(theta)], dim=-1)
+        active_work_all = torch.sum(
+            propulsion.unsqueeze(2) * self.dir_vectors.view(1, 1, 4, 2), dim=-1
+        )
+        total_ep = torch.zeros(B, device=self.device, dtype=self.dtype)
+        active_ep = torch.zeros_like(total_ep)
+        wca_ep = torch.zeros_like(total_ep)
+        accepted_hops = torch.zeros(B, device=self.device, dtype=torch.long)
+        ep_map = (
+            torch.zeros(B, self.grid_size, self.grid_size, device=self.device, dtype=self.dtype)
+            if return_ep_map else None
+        )
+        ep_map_flat = ep_map.view(B, -1) if ep_map is not None else None
+
+        for colour in range(5):
+            # The selection is evaluated at the start of this substep and is
+            # held fixed until its synchronous commit.
+            colours = (sites[..., 0] + 3 * sites[..., 1]).remainder(5)
+            selected = colours == colour
+            probabilities, new_sites, delta_v = self._colour_batch_probabilities(
+                occupancy, sites, active_work_all
+            )
+            self._check_probabilities(probabilities[selected])
+            cumulative = torch.cumsum(probabilities, dim=-1)
+            draws = torch.rand(B, N, device=self.device, dtype=self.dtype)
+            move_idx = (draws.unsqueeze(-1) >= cumulative).sum(dim=-1)
+            planned_moved = selected & (move_idx < 4)
+            safe_dir = move_idx.clamp_max(3)
+            gather_idx = safe_dir.unsqueeze(-1).unsqueeze(-1).expand(B, N, 1, 2)
+            candidate_sites = new_sites.gather(2, gather_idx).squeeze(2)
+            planned_sites = torch.where(
+                planned_moved.unsqueeze(-1), candidate_sites, sites
+            )
+            planned_delta_v = delta_v.gather(
+                2, safe_dir.unsqueeze(-1)
+            ).squeeze(-1)
+            planned_active = active_work_all.gather(
+                2, safe_dir.unsqueeze(-1)
+            ).squeeze(-1)
+
+            # Every selected source has a unique site.  With the five-colour
+            # cardinal schedule, accepted destinations are also unique, so
+            # removing all sources and adding all final sites is race-free.
+            selected_rows, selected_cols = torch.where(selected)
+            if selected_rows.numel() > 0:
+                old_selected = sites[selected_rows, selected_cols]
+                new_selected = planned_sites[selected_rows, selected_cols]
+                occupancy[
+                    selected_rows, old_selected[:, 0], old_selected[:, 1]
+                ] -= 1
+                occupancy[
+                    selected_rows, new_selected[:, 0], new_selected[:, 1]
+                ] += 1
+                sites[selected_rows, selected_cols] = new_selected
+
+            active_inc = torch.where(
+                planned_moved, planned_active / p.Dt, torch.zeros_like(planned_active)
+            )
+            wca_inc = torch.where(
+                planned_moved,
+                -(p.mobility * planned_delta_v) / p.Dt,
+                torch.zeros_like(planned_delta_v),
+            )
+            total_inc = active_inc + wca_inc
+            active_ep += active_inc.sum(dim=1)
+            wca_ep += wca_inc.sum(dim=1)
+            total_ep += total_inc.sum(dim=1)
+            accepted_hops += planned_moved.sum(dim=1, dtype=torch.long)
+            if ep_map_flat is not None:
+                if selected_rows.numel() > 0:
+                    linear = old_selected[:, 0] * self.grid_size + old_selected[:, 1]
+                    ep_map_flat.index_put_(
+                        (selected_rows, linear),
+                        total_inc[selected_rows, selected_cols],
+                        accumulate=True,
+                    )
+
+        if p.Dr > 0:
+            theta_next = (
+                theta + math.sqrt(2.0 * p.Dr * p.dt) * torch.randn_like(theta)
+            ) % (2.0 * math.pi)
+        else:
+            theta_next = theta
+        diagnostics: Dict[str, torch.Tensor] = {
+            "medium_ep": total_ep,
+            "active_medium_ep": active_ep,
+            "wca_medium_ep": wca_ep,
+            "accepted_hops": accepted_hops,
+        }
+        if ep_map is not None:
+            diagnostics["medium_ep_map"] = ep_map
+        return sites, theta_next, occupancy, diagnostics
+
     def _step_inplace(
         self,
         sites: torch.Tensor,
@@ -1078,6 +1292,10 @@ class ThermodynamicLatticeABP:
         return_ep_map: bool = False,
         check_probability_errors: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+        if self.params.update_scheme == "five_color":
+            return self._step_inplace_five_color(
+                sites, theta, occupancy, return_ep_map=return_ep_map
+            )
         if (
             self.backend == "numba"
             and not (torch.is_grad_enabled() and theta.requires_grad)

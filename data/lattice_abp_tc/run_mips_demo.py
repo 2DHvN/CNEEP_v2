@@ -100,10 +100,10 @@ def main() -> None:
     parser.add_argument(
         "--backend",
         choices=["auto", "cuda_fused", "numba", "torch"],
-        default="cuda_fused",
+        default="torch",
         help=(
-            "Default cuda_fused fails fast unless the exact fused L40S path "
-            "can be built; auto permits a slower exact Torch fallback."
+            "five_color uses the Torch tensor path; choose device=cuda:0 to "
+            "execute its tensor operations on a GPU."
         ),
     )
     parser.add_argument("--no-progress", action="store_true")
