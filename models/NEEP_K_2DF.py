@@ -18,32 +18,51 @@ def kneep_spatial_mean_score(branch_maps: torch.Tensor) -> torch.Tensor:
     return branch_maps.mean(dim=(-2, -1)).sum(dim=1)
 
 
-def kneep_local_ep_increment(branch_maps: torch.Tensor) -> torch.Tensor:
-    """Sum branches and return the local EP increment map ``[B,Lx,Ly]``."""
+def kneep_normalize_branch_maps(branch_maps: torch.Tensor) -> torch.Tensor:
+    """Convert raw KNEEP branch maps to local EP maps by dividing by Lx*Ly.
+
+    KNEEP is trained with a spatial-mean score.  Consequently the raw
+    ``return_maps=True`` tensor carries the global score scale at every pixel;
+    every predicted map must be divided by the number of spatial sites before
+    it is interpreted or plotted locally.
+    """
     if branch_maps.ndim != 4:
         raise ValueError(f"Expected branch maps [B,K,Lx,Ly], got {tuple(branch_maps.shape)}")
-    return branch_maps.sum(dim=1)
+    n_sites = branch_maps.shape[-2] * branch_maps.shape[-1]
+    return branch_maps / float(n_sites)
 
 
-def kneep_total_ep_increment(
-    branch_maps: torch.Tensor,
-    cell_area: float = 1.0,
-) -> torch.Tensor:
-    """Integrate local EP increments over space, following ``utils.validate``."""
-    local_map = kneep_local_ep_increment(branch_maps)
-    return local_map.sum(dim=(-2, -1)) * float(cell_area)
+def kneep_local_ep_increment(branch_maps: torch.Tensor) -> torch.Tensor:
+    """Normalize raw branch maps by Lx*Ly, then sum their local increments."""
+    return kneep_normalize_branch_maps(branch_maps).sum(dim=1)
+
+
+def kneep_total_ep_increment(branch_maps: torch.Tensor) -> torch.Tensor:
+    """Return total EP from the raw maps' spatial means, without map scaling.
+
+    Total EP follows the same spatial-mean score used by NEEP training.  The
+    ``1/(Lx*Ly)`` normalization belongs only to local-map visualization and is
+    deliberately not part of this computation.
+    """
+    return kneep_spatial_mean_score(branch_maps)
 
 
 def kneep_total_from_spatial_mean(
     branch_scores: torch.Tensor,
     spatial_shape,
-    cell_area: float = 1.0,
 ) -> torch.Tensor:
-    """Convert ``model(x)`` spatial means to total EP increments."""
+    """Return the total EP increment represented by ``model(x)``.
+
+    ``branch_scores`` are already spatial means of the raw maps, hence already
+    have the global NEEP score scale.  Do not multiply by Lx*Ly again.
+    ``spatial_shape`` is retained to validate the caller's convention.
+    """
     if branch_scores.ndim != 2:
         raise ValueError(f"Expected branch scores [B,K], got {tuple(branch_scores.shape)}")
     lx, ly = (int(spatial_shape[0]), int(spatial_shape[1]))
-    return branch_scores.sum(dim=1) * (lx * ly) * float(cell_area)
+    if lx <= 0 or ly <= 0:
+        raise ValueError(f"Invalid spatial shape {(lx, ly)}")
+    return branch_scores.sum(dim=1)
 
 # ──────────────────────────────────────────────────────────────
 # Periodic padding for 2D inputs
@@ -400,10 +419,10 @@ class MultiScaleK_2DF(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    # ----- shared backbone: produces the local EP map ----- #
+    # ----- shared backbone: produces the force field ----- #
     def _local_map(self, x: torch.Tensor,
                    branch: _KBranch2D) -> torch.Tensor:
-        """Run one branch on input *x* and return [B, 1, Lx, Ly] local EP map."""
+        """Run one branch on input *x* and return [B, C, Lx, Ly] force."""
         return branch(x)
 
     def shell_bounds(self):
@@ -426,11 +445,13 @@ class MultiScaleK_2DF(nn.Module):
         If return_maps is False:
             J : [B, K+1], the spatial mean of each branch's local EP
                 increment map.  This is the intensive score used for stable
-                NEEP training; integrate it over space only when reporting a
-                total EP increment.
+                NEEP training and the total-EP output scale.  Do not divide
+                this score by Lx*Ly again.
         If return_maps is True:
-            maps : [B, K+1, Lx, Ly] where maps[:, k, :, :] is the local EP
-                   increment map at distance k.  No dt division is applied.
+            maps : [B, K+1, Lx, Ly], the raw branch maps.  Divide these maps
+                   by Lx*Ly (or use ``kneep_normalize_branch_maps`` /
+                   ``kneep_local_ep_increment``) before local interpretation.
+                   No dt division is applied.
         """
         if self.n_components > 1:
             # x is [B, seq_len, C, Lx, Ly]
