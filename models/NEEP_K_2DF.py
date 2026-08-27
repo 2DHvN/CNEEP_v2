@@ -368,11 +368,16 @@ class MultiScaleK_2DF(nn.Module):
         self.positional = opt.positional
         self.beta = opt.beta
         self.max_distance = opt.max_distance
+        self.seq_len = int(opt.seq_len)
+        if self.seq_len != 2:
+            raise ValueError("MultiScaleK_2DF requires seq_len=2.")
 
         self.n_components = getattr(opt, "n_components", 1)
         # Input components may contain contextual observables that should not
-        # themselves enter the final force·increment contraction.  By default
-        # retain the historical behaviour and contract every component.
+        # themselves enter the final force·increment contraction.  External
+        # generalized increments (for example wrapped delta-theta) can be
+        # contracted without adding them as state/context channels.  By default
+        # retain the historical behaviour and contract every input component.
         component_indices = getattr(
             opt, "ep_component_indices", tuple(range(self.n_components))
         )
@@ -387,7 +392,15 @@ class MultiScaleK_2DF(nn.Module):
                 f"for n_components={self.n_components}."
             )
         self.n_ep_components = len(self.ep_component_indices)
-        in_channels = opt.seq_len * self.n_components + (2 if opt.positional else 0)
+        self.n_external_ep_components = int(
+            getattr(opt, "n_external_ep_components", 0)
+        )
+        if self.n_external_ep_components < 0:
+            raise ValueError("n_external_ep_components must be nonnegative.")
+        self.n_force_components = (
+            self.n_ep_components + self.n_external_ep_components
+        )
+        in_channels = self.seq_len * self.n_components + (2 if opt.positional else 0)
         hidden_channels = opt.n_channel
         n_hidden = getattr(opt, "n_hidden", 2)
         self.k_kernel_geometry = _canonical_kernel_geometry(getattr(opt, "k_kernel_geometry", "chebyshev"))
@@ -404,7 +417,7 @@ class MultiScaleK_2DF(nn.Module):
                 in_channels=in_channels,
                 hidden_channels=hidden_channels,
                 n_hidden=n_hidden,
-                n_components=self.n_ep_components,
+                n_components=self.n_force_components,
                 kernel_geometry=self.k_kernel_geometry,
                 shell_width=self.shell_width,
                 shell_offset=self.shell_offset,
@@ -422,7 +435,7 @@ class MultiScaleK_2DF(nn.Module):
     # ----- shared backbone: produces the force field ----- #
     def _local_map(self, x: torch.Tensor,
                    branch: _KBranch2D) -> torch.Tensor:
-        """Run one branch on input *x* and return [B, C, Lx, Ly] force."""
+        """Run one branch and return [B, C_force, Lx, Ly] generalized force."""
         return branch(x)
 
     def shell_bounds(self):
@@ -430,15 +443,27 @@ class MultiScaleK_2DF(nn.Module):
         return [(branch.r_inner, branch.r_outer) for branch in self.branches]
 
     # ----- forward ----- #
-    def forward(self, x: torch.Tensor, return_maps: bool = False) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_maps: bool = False,
+        external_increments: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         Parameters
         ----------
-        x : If n_components == 1: [B, seq_len, Lx, Ly]
-            If n_components > 1: [B, seq_len, n_components, Lx, Ly]
+        x : If n_components == 1: [B, 2, Lx, Ly]
+            If n_components > 1: [B, 2, n_components, Lx, Ly]
         return_maps : bool (optional, default False)
             If True, returns the full local EP maps [B, K, Lx, Ly].
             If False, returns the scalar EP per distance [B, K].
+        external_increments : torch.Tensor (optional)
+            Generalized increments [B, C_external, Lx, Ly] that enter the
+            force contraction without becoming state/context channels.  This
+            argument is required when ``n_external_ep_components > 0`` and
+            must be negated whenever the two frames are swapped.  Force and
+            increment channels follow ``ep_component_indices`` first, then
+            the configured external-increment order.
 
         Returns
         -------
@@ -455,7 +480,15 @@ class MultiScaleK_2DF(nn.Module):
         """
         if self.n_components > 1:
             # x is [B, seq_len, C, Lx, Ly]
+            if x.dim() != 5:
+                raise ValueError("Expected x with shape [B, seq_len, C, Lx, Ly].")
             B, S, C, Lx, Ly = x.shape
+            if S != self.seq_len:
+                raise ValueError(f"Expected seq_len={self.seq_len}, got {S}.")
+            if C != self.n_components:
+                raise ValueError(
+                    f"Expected {self.n_components} state components, got {C}."
+                )
             x_ = x.reshape(B, S * C, Lx, Ly)
             _x = torch.flip(x, [1]).reshape(B, S * C, Lx, Ly)
             
@@ -465,12 +498,44 @@ class MultiScaleK_2DF(nn.Module):
             _dx = -dx                                 # Time reversed displacement
         else:
             # Time-forward and time-reversed inputs
+            if x.dim() != 4:
+                raise ValueError("Expected x with shape [B, seq_len, Lx, Ly].")
+            if x.shape[1] != self.seq_len:
+                raise ValueError(
+                    f"Expected seq_len={self.seq_len}, got {x.shape[1]}."
+                )
             x_ = x                          # forward
             _x = torch.flip(x, [1])         # reverse time dimension
             
             # Extract displacement vector
             dx = (x[:, 1, :, :] - x[:, 0, :, :]).unsqueeze(1)  # [B, 1, Lx, Ly]
             _dx = -dx
+
+        if self.n_external_ep_components:
+            expected = (
+                dx.shape[0],
+                self.n_external_ep_components,
+                dx.shape[-2],
+                dx.shape[-1],
+            )
+            if external_increments is None:
+                raise ValueError(
+                    "external_increments is required when "
+                    f"n_external_ep_components={self.n_external_ep_components}."
+                )
+            if tuple(external_increments.shape) != expected:
+                raise ValueError(
+                    f"Expected external_increments with shape {expected}, got "
+                    f"{tuple(external_increments.shape)}."
+                )
+            if external_increments.device != dx.device or external_increments.dtype != dx.dtype:
+                raise ValueError("external_increments must match x dtype and device.")
+            dx = torch.cat((dx, external_increments), dim=1)
+            _dx = -dx
+        elif external_increments is not None:
+            raise ValueError(
+                "external_increments was provided but n_external_ep_components is zero."
+            )
 
         # Optionally append positional channels
         if self.positional:
@@ -481,7 +546,7 @@ class MultiScaleK_2DF(nn.Module):
         map_list = []
 
         for branch in self.branches:
-            # Branch outputs Force vector: [B, C, Lx, Ly]
+            # Branch outputs generalized force: [B, C_force, Lx, Ly]
             A_fwd = self._local_map(x_, branch)
             A_rev = self._local_map(_x, branch)
 
@@ -489,7 +554,7 @@ class MultiScaleK_2DF(nn.Module):
             map_fwd = (A_fwd * dx).sum(dim=1, keepdim=True)   # [B, 1, Lx, Ly]
             map_rev = (A_rev * _dx).sum(dim=1, keepdim=True)  # [B, 1, Lx, Ly]
 
-            # Time-reversal antisymmetry at the map level
+            # Time-reversal antisymmetry, provided external increments are odd.
             local_ep = map_fwd - map_rev   # [B, 1, Lx, Ly]
 
             if return_maps:
