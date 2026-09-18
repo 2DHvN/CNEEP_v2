@@ -15,6 +15,7 @@ or of equality with irreversibility inferred from temporally coarse frames.
 from __future__ import annotations
 
 import math
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from numbers import Integral
@@ -208,13 +209,41 @@ def event_medium_ep(config, sites, orientations, particle, event):
     return math.log(before) - math.log(reverse), pieces
 
 
+def simulation_backend(backend="auto"):
+    """Resolve the simulation device independently of the training device.
+
+    ``auto`` chooses CUDA when Numba can access it, otherwise CPU. An explicit
+    CUDA request raises if unavailable; execution failures never silently fall
+    back to another backend. CPU-only use does not import the CUDA module.
+    """
+    if backend not in ("cpu", "cuda", "auto"):
+        raise ValueError("backend must be 'cpu', 'cuda', or 'auto'")
+    if backend == "cpu":
+        return "cpu"
+    from ._gillespie_cuda import cuda_available
+
+    if cuda_available():
+        return "cuda"
+    if backend == "cuda":
+        raise RuntimeError(
+            "CUDA simulation requested but Numba CUDA is unavailable. "
+            "Use backend='cpu' or install a compatible CUDA driver/toolkit."
+        )
+    return "cpu"
+
+
 def simulate_ensemble(config, n_trajectories, n_frames, sample_dt, burn_time=0.0,
-                      seed=0, workers=1, progress=False, initial_states=None):
+                      seed=0, workers=None, progress=False, initial_states=None,
+                      *, backend="cpu", batch_size=64):
     """Simulate independent replicas with exact Gillespie event times.
 
-    workers controls CPU threads across replicas; Numba releases the GIL.
-    Replicas have distinct deterministic RNG seeds, so changing workers does
-    not change results. sample_dt only selects observation times, not an
+    workers controls CPU threads across replicas; None uses available CPUs,
+    capped by the replica count. Numba releases the GIL. backend is 'cpu',
+    'cuda', or 'auto'; batch_size bounds concurrent CUDA replicas/device
+    buffers. Each replica retains its own clock and RNG stream. Changing CPU
+    workers or CUDA batch_size does not change that backend's seeded paths.
+    CPU and CUDA use different RNGs, so paths need not match across backends.
+    sample_dt only selects observation times, not an
     integration step. A pending event is retained across frame boundaries.
     Optional initial_states [M,L,L] overrides density-derived initialization;
     each replica must contain at least one particle, with values -1..3.
@@ -223,7 +252,9 @@ def simulate_ensemble(config, n_trajectories, n_frames, sample_dt, burn_time=0.0
         raise TypeError("config must be LABPMConfig")
     count = _integer("n_trajectories", n_trajectories, 1)
     frames = _integer("n_frames", n_frames, 1)
-    workers = min(_integer("workers", workers, 1), count)
+    workers = min(_integer("workers", (os.cpu_count() or 1) if workers is None else workers, 1), count)
+    batch_size = _integer("batch_size", batch_size, 1)
+    backend = simulation_backend(backend)
     seed = _integer("seed", seed, 0)
     sample_dt = _scalar("sample_dt", sample_dt, strict=True)
     burn_time = _scalar("burn_time", burn_time)
@@ -267,6 +298,22 @@ def simulate_ensemble(config, n_trajectories, n_frames, sample_dt, burn_time=0.0
         return _simulate_single(initial(index), physical, betas, frames,
                                 sample_dt, burn_time, int(seeds[index]))
 
+    def pack(states, ep_maps, shell_ep, hops, rotations):
+        return LABPMResult(
+            states=states, times=np.arange(frames, dtype=np.float64) * sample_dt,
+            medium_ep=ep_maps.sum(axis=(-2, -1)), medium_ep_maps=ep_maps,
+            shell_ep=shell_ep, hop_counts=hops, rotation_counts=rotations, seeds=seeds,
+        )
+
+    if backend == "cuda":
+        from ._gillespie_cuda import simulate_cuda
+
+        initial_batch = np.stack([initial(i) for i in range(count)])
+        return pack(*simulate_cuda(
+            initial_batch, physical, betas, frames, sample_dt, burn_time, seeds,
+            batch_size=batch_size, progress=progress,
+        ))
+
     states = np.empty((count, frames, size, size), dtype=np.int8)
     ep_maps = np.empty((count, frames - 1, size, size), dtype=np.float64)
     shell_ep = np.empty((count, frames - 1, config.interaction_radius + 1), dtype=np.float64)
@@ -278,24 +325,20 @@ def simulate_ensemble(config, n_trajectories, n_frames, sample_dt, burn_time=0.0
 
     from tqdm.auto import tqdm
     with tqdm(total=count, desc="LABP-M Gillespie replicas", disable=not progress) as bar:
-        # Compile and finish replica zero before starting concurrent kernels.
-        store(0, run(0))
-        bar.update(1)
         if workers == 1:
-            for i in range(1, count):
+            for i in range(count):
                 store(i, run(i))
                 bar.update(1)
         else:
+            # Prepare the compiled signature without serializing a full path.
+            # Real trajectories (including zero) all start in the worker pool.
+            _simulate_single(initial(0), physical, betas, 1, sample_dt, 0.0, int(seeds[0]))
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                pending = {pool.submit(run, i): i for i in range(1, count)}
+                pending = {pool.submit(run, i): i for i in range(count)}
                 for future in as_completed(pending):
                     store(pending.pop(future), future.result())
                     bar.update(1)
-    return LABPMResult(
-        states=states, times=np.arange(frames, dtype=np.float64) * sample_dt,
-        medium_ep=ep_maps.sum(axis=(-2, -1)), medium_ep_maps=ep_maps,
-        shell_ep=shell_ep, hop_counts=hops, rotation_counts=rotations, seeds=seeds,
-    )
+    return pack(states, ep_maps, shell_ep, hops, rotations)
 
 
 def encode_observations(result_or_states):

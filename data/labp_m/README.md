@@ -2,9 +2,9 @@
 
 Four discrete orientations, hard-core exclusion, periodic boundaries, and an
 exact Gillespie direct method. Independent replicas run in parallel CPU threads
-using a Numba kernel; each replica executes one event at a time. Training can
-run on CUDA or CPU. No GPU simulation, tau-leaping, sweeps, or fixed integration
-time step is used.
+or in a fused CUDA kernel. Each replica keeps its own event clock and executes
+one event at a time. Training and simulation devices are selected independently.
+There is no tau-leaping, sweep, or fixed numerical integration time step.
 
 ## Interaction and events
 
@@ -35,7 +35,7 @@ a reverse. Lateral and rotation rates may be zero. The cutoff must obey
 Run from `CNEEP_v2`, or put that directory on `sys.path`:
 
 ```python
-from data.labp_m import LABPMConfig, simulate_ensemble, encode_observations
+from data.labp_m import LABPMConfig, simulate_ensemble, encode_observations, simulation_backend
 
 config = LABPMConfig(
     lattice_size=24, density=0.35,
@@ -46,7 +46,7 @@ config = LABPMConfig(
 result = simulate_ensemble(
     config, n_trajectories=16, n_frames=1001,
     sample_dt=0.01, burn_time=100.0,
-    seed=17, workers=4, progress=True,
+    seed=17, backend="auto", workers=4, batch_size=64, progress=True,
 )
 video = encode_observations(result)  # CPU torch [16,1001,4,24,24]
 ```
@@ -58,7 +58,10 @@ are relative to burn-in. An absorbing state produces repeated frames with
 zero subsequent events. The first call includes Numba compilation time.
 
 Initial positions/orientations and event RNG streams are independent across
-replicas. `seed` controls all replicas and results do not depend on `workers`.
+replicas. `seed` controls all replicas. Within a backend, results do not depend
+on CPU `workers` or CUDA `batch_size`. CPU and CUDA use different event RNGs,
+so they sample the same CTMC distribution but do not produce identical seeded
+paths. The random initial configurations are the same across backends.
 Optional `initial_states` is integer `[M,L,L]`, with `-1` empty and `0..3`
 occupied orientations; it overrides random initialization and the requested
 density. Inputs are not mutated.
@@ -67,6 +70,61 @@ A segment tree selects particles proportional to their six-event total rate
 in `O(log N)` time. A hop only invalidates rates of the moved particle and
 particles along the affected row/column rays. Rotation only changes that
 particle's rates. This avoids a full lattice-wide rate calculation per event.
+
+### Selecting parallel execution
+
+- `backend="cpu"` (API default): compiled Numba simulations in a thread pool.
+  `workers=None` uses available logical CPUs, capped by the replica count;
+  `workers=1` runs serially. A short initialization compiles the kernel before
+  all replicas, including replica zero, are submitted to the pool.
+- `backend="cuda"`: one CUDA block per replica. A leader selects and executes
+  the next event; block threads refresh the affected particle rates. Independent
+  replica clocks need not agree, while the observation grid is shared. The
+  event loop stays on the device, without a Python call for every jump.
+- `backend="auto"`: uses CUDA if Numba reports it available, otherwise CPU.
+  This selects an available device, not the empirically fastest backend.
+  `simulation_backend("auto")` exposes that choice. An explicit unavailable
+  CUDA request raises an error. Runtime/compilation failures are surfaced,
+  not silently replaced by a CPU run.
+
+`batch_size` controls how many replicas are sent to CUDA together; it is not a
+physical timestep or an event approximation. CPU ignores this setting. Every
+replica retains its own RNG state, so splitting the same ensemble into smaller
+CUDA batches preserves its paths. Returned arrays are still NumPy arrays on
+the host; large ensembles require memory for the complete requested output,
+including float64 spatial entropy maps.
+
+The CUDA launcher automatically reduces the replica batch if its estimated
+working/output buffers exceed 70% of currently free device memory. Kernel
+launches process at most 1024 events per replica, then resume from the saved
+clock, RNG, rates, and partially accumulated observation interval. Only a
+small progress array returns to the host between these launches. This keeps a
+long burn-in or observation interval from becoming one simulation-long kernel
+launch, without changing the CTMC or dropping pending events.
+
+CUDA simulation requires a working **Numba CUDA** installation, including a
+compatible NVIDIA driver and CUDA compilation libraries. CUDA-enabled PyTorch
+alone is not sufficient. Rates, clocks, and entropy use float64 on both
+backends. GPU throughput depends on the device, number of replicas, lattice
+size, and output volume; a small ensemble can be faster on CPU.
+
+Both notebooks expose `SIMULATION_BACKEND` (environment override
+`LABPM_BACKEND`, default `auto`), `CUDA_BATCH_SIZE`, and `WORKERS` (default
+`None`, all available CPUs; environment override `LABPM_WORKERS`). The training
+notebook records the resolved simulation backend and simulator source hashes
+in its cache metadata, independently of its PyTorch training device.
+
+To compare throughput on the target machine after compilation:
+
+```text
+python -m data.labp_m.benchmark --replicas 16 64 --workers 1 4 8
+python -m data.labp_m.benchmark --backends cuda --replicas 64 128 --batch-size 64
+```
+
+The first command includes CUDA only when available. Timing includes allocation
+and copying results to the host, and the script checks seeded reproducibility
+within each backend. Reported event counts exclude discarded burn-in events;
+elapsed time includes burn-in. Compare replica throughput for equal settings.
 
 ## Reference irreversibility and outputs
 
@@ -160,4 +218,12 @@ Run simulator tests from the project directory:
 
 ```text
 python -m unittest discover -s tests -p test_labp_m.py
+python -m unittest discover -s tests -p test_labp_m_cuda.py
 ```
+
+CUDA-specific tests skip when no device is available. For a small correctness
+check without GPU hardware, start a **fresh** process with
+`NUMBA_ENABLE_CUDASIM=1` and run the second command. Numba's CUDA simulator
+checks the algorithm and thread coordination; it does not validate device
+compilation or measure real GPU performance. The benchmark rejects simulated
+CUDA timings.
