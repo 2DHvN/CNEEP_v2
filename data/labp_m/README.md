@@ -164,22 +164,38 @@ left, right, turn left, turn right.
 
 ## Training notebook
 
-Open [Corr_labpm.ipynb](../../notebooks/Corr_labpm.ipynb). It defaults to **16
-training replicas**, 4 validation replicas, and 4 test replicas with distinct
-seeds; it rejects a single training replica. Pairs never cross replica
-boundaries. Four directional occupancy channels preserve the discrete state.
-The model uses exclusive Chebyshev shell branches.
+Open [Corr_labpm.ipynb](../../notebooks/Corr_labpm.ipynb). It defaults to **100
+training replicas x 1000 adjacent intervals** (1001 saved frames per replica),
+plus 20 validation and 20 test replicas with distinct seeds. It matches the
+saved sanity-check physics: L=30, density 0.4, forward rate 8, backward/lateral
+rates 0.1, each rotation rate 0.01, and shell weights (1, 2, 3). Each trajectory
+is relaxed for **5000 physical time units** before data collection.
 
-Set `SAMPLE_DT` in the notebook to control the fixed physical lag of every
-training pair. Sampling frequency is `1/SAMPLE_DT`. `OBSERVATION_TIME` controls
-the post-burn duration, and `N_FRAMES = OBSERVATION_TIME/SAMPLE_DT + 1` is derived
-automatically (the duration must be an integer multiple of the interval).
-For example, duration 5 and `SAMPLE_DT=0.005` give 1001 frames at frequency 200;
-using `SAMPLE_DT=0.01` gives 501 frames over the same duration. All splits use
-the same lag, checked against the actual saved times, and cache keys include
-the sampling settings. Gillespie waiting times remain variable internally;
-they are never passed to training as variable lags. A frame with no intervening
-events repeats the state; no state interpolation is performed.
+`TARGET_EVENTS_PER_INTERVAL=3` sets the desired average number of total-system
+hops plus rotations between snapshots. A separate 16-replica pilot, with the
+same burn time and 200 time units of observation per replica, estimates the
+pooled event rate from total counts / total replica-time. The notebook sets
+`SAMPLE_DT = TARGET_EVENTS_PER_INTERVAL / measured_event_rate`, then uses this
+single fixed lag for every train/validation/test pair. Counts vary naturally;
+there is no selection of intervals with exactly three events. Pilot summaries
+and dataset caches retain their seeds, physics, backend, and simulator hash.
+
+Set `SAMPLE_DT_OVERRIDE` to a positive value to bypass calibration.
+`N_INTERVALS` fixes dataset size, `N_FRAMES = N_INTERVALS + 1`, and
+`OBSERVATION_TIME = N_INTERVALS * SAMPLE_DT` is derived. With the saved physics,
+a CPU pilot measured rate 88.8953/time, giving `SAMPLE_DT` about 0.03375 and
+about 33.75 time units per training trajectory. The measured lag can differ
+with a different pilot/backend. Sampling diagnostics report actual count
+means, replica uncertainty, zero-event frequency, and quantiles for each split.
+Gillespie waiting times remain variable internally; a frame without events
+repeats the state and no interpolation is performed.
+
+Pairs never cross replica boundaries. Compact int8 trajectories stay on the
+CPU; the four directional occupancy channels are constructed only for the
+current minibatch. This avoids allocating the entire 100 x 1001 x 4 x 30 x 30
+float32 training video (about 1.34 GiB). Exact entropy maps still occupy host
+memory. The model uses exclusive Chebyshev shell branches. `LABPM_CACHE_DIR`
+can override the default `data/labp_m/cache` directory.
 
 The notebook compares held-out observed irreversibility with event-path EP.
 Fixed-time frames hide intermediate events, so their inferred irreversibility
@@ -202,9 +218,21 @@ using multiple replicas and matched initial configurations. It includes:
 - Late-time density histograms and radially averaged density structure factors.
 - Random configurations with identical particle count as a reference, and
   standard errors computed across independent replicas.
+- A final waiting-time diagnostic cell: exact whole-system inter-event PDF,
+  survival function, and the rescaled clock `a * tau` against `Exp(1)`.
+
+The waiting-time cell continues each case's final configurations using the
+CPU Gillespie kernel for `WAITING_EVENTS_PER_REPLICA=20000` complete intervals
+(256 in smoke mode). The first delay after each snapshot is discarded; samples
+include both hops and rotations. These are event-sampled continuation traces,
+not waiting times reconstructed from saved frames, per-particle residence
+times, or a time-weighted state distribution. Absorbing cases return fewer or
+no samples. Outputs are `waiting_time_distribution.png`,
+`waiting_time_samples.npz` (with replica offsets, pre-event rates, and event
+types), and `waiting_time_summary.json` in the notebook's result directory.
 
 `SAMPLE_DT` and `OBSERVATION_TIME` control its fixed-time observation grid too.
-Defaults use L=40, 4 replicas/model, duration 500, and sampling interval 1;
+The saved settings use L=30, 4 replicas/model, duration 5000, and sampling interval 1;
 `BURN_TIME=0` makes relaxation from a random configuration visible. These are
 screening settings, not a claimed MIPS coexistence point. Inspect late-time
 drift, coarse-graining scale, and system-size dependence before interpreting

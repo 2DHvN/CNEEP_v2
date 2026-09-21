@@ -85,7 +85,8 @@ def _wait(total):
 
 
 @njit(cache=True, nogil=True)
-def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, seed):
+def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, seed,
+                     waiting_trace=None):
     np.random.seed(seed)
     size = initial.shape[0]
     n_particles = int(np.sum(initial >= 0))
@@ -121,12 +122,14 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
     marked = np.zeros(n_particles, dtype=np.bool_)
     contribution = np.zeros(radius + 1, dtype=np.float64)
     baseline_affinity = math.log(physical[0]) - math.log(physical[1])
-    next_event_time = _wait(tree[1])
+    pending_wait = _wait(tree[1])
+    next_event_time = pending_wait
+    trace_count = 0
 
     for frame in range(n_frames):
         target = burn_time + frame * sample_dt
         interval = frame - 1
-        while next_event_time <= target:
+        while next_event_time <= target and math.isfinite(next_event_time):
             event_time = next_event_time
             mass = np.random.random() * tree[1]
             if mass >= tree[1]:
@@ -143,6 +146,15 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
                 if mass < cumulative:
                     event = candidate
                     break
+
+            if waiting_trace is not None and trace_count < len(waiting_trace):
+                # Record the rate that generated this waiting time, before
+                # changing the state. Diagnostic callers use a single frame
+                # and stop after filling this bounded event buffer.
+                waiting_trace[trace_count, 0] = pending_wait
+                waiting_trace[trace_count, 1] = tree[1]
+                waiting_trace[trace_count, 2] = event
+                trace_count += 1
 
             if event >= 4:
                 turn = -1 if event == 4 else 1
@@ -214,7 +226,10 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
                     marked[other] = False
 
             # Keep the next event pending across observation boundaries.
-            next_event_time = event_time + _wait(tree[1])
+            pending_wait = _wait(tree[1])
+            next_event_time = event_time + pending_wait
+            if waiting_trace is not None and n_frames == 1 and trace_count == len(waiting_trace):
+                break
 
         for particle in range(n_particles):
             row, col = sites[particle]
