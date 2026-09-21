@@ -4,8 +4,8 @@ One 32-thread block owns one replica, including its clock and RNG. The leader
 selects and executes an event; the block refreshes the affected particle rates
 in parallel. Tree ancestors are then updated by the leader, avoiding concurrent
 writes to shared ancestors. Event loops stay on the device, including burn-in
-and fixed-time observations. Bounded launches preserve clocks, pending events,
-and partial observation intervals between launches. There is no common ensemble
+and fixed-time or single-event observations. Bounded launches preserve clocks,
+pending holding times, and partial observation intervals. There is no common ensemble
 clock, time step, rejection sampling, or approximation of the event process.
 
 CUDA is imported only when requested. Replica chunks bound device allocations;
@@ -152,7 +152,8 @@ def _get_kernel():
     def kernel(sites, orientations, occupancy, particle_counts, physical, betas,
                rng, rates, tree, affected, marked, states, ep_maps, shell_ep,
                hops, rotations, sample_dt, burn_time, leaf_count, clocks,
-               frame_cursors, partial_frames, initialize, event_budget):
+               frame_cursors, partial_frames, initialize, event_budget,
+               event_mode, event_trace, pending_waits):
         replica = cuda.blockIdx.x
         lane = cuda.threadIdx.x
         if frame_cursors[replica] >= states.shape[1]:
@@ -182,7 +183,8 @@ def _get_kernel():
                 cuda.syncthreads()
                 level //= 2
             if lane == 0:
-                clock[0] = wait_time(tree[replica, 1], rng, replica)
+                pending_waits[replica] = wait_time(tree[replica, 1], rng, replica)
+                clock[0] = pending_waits[replica]
         elif lane == 0:
             clock[0] = clocks[replica]
         cuda.syncthreads()
@@ -191,12 +193,14 @@ def _get_kernel():
         for frame in range(frame_cursors[replica], states.shape[1]):
             target = burn_time + frame * sample_dt
             interval = frame - 1
+            if event_mode and interval >= 0:
+                target = math.inf
             if partial_frames[replica] == 0:
                 for index in range(lane, size * size, cuda.blockDim.x):
                     row = index // size
                     col = index % size
                     states[replica, frame, row, col] = -1
-                    if interval >= 0:
+                    if interval >= 0 and not event_mode:
                         ep_maps[replica, interval, row, col] = 0.0
                 if interval >= 0:
                     for index in range(lane, radius + 1, cuda.blockDim.x):
@@ -208,8 +212,16 @@ def _get_kernel():
 
             while True:
                 if lane == 0:
-                    control[0] = 1 if clock[0] <= target else 0
+                    control[0] = 1 if math.isfinite(clock[0]) and clock[0] <= target else 0
+                    if event_mode and interval >= 0 and not math.isfinite(clock[0]):
+                        control[0] = -1
                 cuda.syncthreads()
+                if control[0] < 0:
+                    # All lanes exit together. The host reports absorption
+                    # instead of returning fabricated no-change event pairs.
+                    if lane == 0:
+                        frame_cursors[replica] = -1
+                    return
                 if control[0] == 0:
                     break
                 if lane == 0:
@@ -236,6 +248,16 @@ def _get_kernel():
                             break
                     affected[replica, 0] = particle
                     control[1] = 1
+                    if event_mode and interval >= 0:
+                        event_trace[replica, interval, 0] = pending_waits[replica]
+                        event_trace[replica, interval, 1] = tree[replica, 1]
+                        event_trace[replica, interval, 2] = event
+                        event_trace[replica, interval, 3] = sites[replica, particle, 0]
+                        event_trace[replica, interval, 4] = sites[replica, particle, 1]
+                        event_trace[replica, interval, 5] = sites[replica, particle, 0]
+                        event_trace[replica, interval, 6] = sites[replica, particle, 1]
+                        event_trace[replica, interval, 7] = 0.0
+                        event_trace[replica, interval, 8] = clock[0]
                     if event >= 4:
                         turn = -1 if event == 4 else 1
                         orientations[replica, particle] = (orientations[replica, particle] + turn + 4) % 4
@@ -268,8 +290,13 @@ def _get_kernel():
                         if interval >= 0:
                             entropy = math.log(forward) - math.log(reverse)
                             hops[replica, interval] += 1
-                            ep_maps[replica, interval, row, col] += 0.5 * entropy
-                            ep_maps[replica, interval, new_row, new_col] += 0.5 * entropy
+                            if event_mode:
+                                event_trace[replica, interval, 5] = new_row
+                                event_trace[replica, interval, 6] = new_col
+                                event_trace[replica, interval, 7] = entropy
+                            else:
+                                ep_maps[replica, interval, row, col] += 0.5 * entropy
+                                ep_maps[replica, interval, new_row, new_col] += 0.5 * entropy
                             if event == 1:
                                 shell_ep[replica, interval, 0] -= baseline
                                 for beta_index in range(betas.size):
@@ -307,9 +334,12 @@ def _get_kernel():
                             index //= 2
                         marked[replica, particle] = 0
                     # Preserve this pending event across observation frames.
-                    clock[0] += wait_time(tree[replica, 1], rng, replica)
+                    pending_waits[replica] = wait_time(tree[replica, 1], rng, replica)
+                    clock[0] += pending_waits[replica]
                 cuda.syncthreads()
                 events_done += 1
+                if event_mode and interval >= 0:
+                    break  # Save this completed one-event pair before yielding.
                 if events_done >= event_budget:
                     if lane == 0:
                         clocks[replica] = clock[0]
@@ -329,21 +359,24 @@ def _get_kernel():
                 partial_frames[replica] = 0
                 clocks[replica] = clock[0]
             cuda.syncthreads()
+            if events_done >= event_budget:
+                return
 
     return kernel
 
 
-def _device_bytes_per_replica(size, particles, frames, shells, leaf_count):
+def _device_bytes_per_replica(size, particles, frames, shells, leaf_count, event_mode=False):
     """Working arrays plus output arrays, excluding tiny shared inputs."""
     return (
         size * size * 4 + particles * (2 * 4 + 4 + 6 * 8 + 1)
-        + 2 * leaf_count * 8 + (1 + 8 * (shells - 1)) * 4 + 16 + 4 + 8 + 8 + 1
+        + 2 * leaf_count * 8 + (1 + 8 * (shells - 1)) * 4 + 16 + 4 + 8 + 8 + 1 + 8
         + frames * size * size
-        + (frames - 1) * (size * size * 8 + shells * 8 + 2 * 8)
+        + (frames - 1) * ((9 * 8 if event_mode else size * size * 8) + shells * 8 + 2 * 8)
     )
 
 
-def _simulate_batch(initial, physical, betas, frames, sample_dt, burn_time, seeds):
+def _simulate_batch(initial, physical, betas, frames, sample_dt, burn_time, seeds,
+                    event_mode=False):
     from numba import cuda as runtime
 
     kernel = _get_kernel()
@@ -362,7 +395,7 @@ def _simulate_batch(initial, physical, betas, frames, sample_dt, burn_time, seed
         occupancy[replica, rows, cols] = np.arange(count, dtype=np.int32)
     outputs = (
         runtime.device_array((batch, frames, size, size), dtype=np.int8),
-        runtime.device_array((batch, frames - 1, size, size), dtype=np.float64),
+        runtime.device_array((batch, 0 if event_mode else frames - 1, size, size), dtype=np.float64),
         runtime.device_array((batch, frames - 1, betas.size + 2), dtype=np.float64),
         runtime.device_array((batch, frames - 1), dtype=np.int64),
         runtime.device_array((batch, frames - 1), dtype=np.int64),
@@ -381,6 +414,8 @@ def _simulate_batch(initial, physical, betas, frames, sample_dt, burn_time, seed
     device_affected = runtime.device_array((batch, 1 + 8 * (betas.size + 1)), dtype=np.int32)
     device_marked = runtime.device_array((batch, maximum), dtype=np.int8)
     device_clocks = runtime.device_array(batch, dtype=np.float64)
+    device_waits = runtime.device_array(batch, dtype=np.float64)
+    device_trace = runtime.device_array((batch, frames - 1 if event_mode else 0, 9), dtype=np.float64)
     device_cursors = runtime.to_device(np.zeros(batch, dtype=np.int64))
     device_partial = runtime.to_device(np.zeros(batch, dtype=np.int8))
     initialize = True
@@ -390,25 +425,34 @@ def _simulate_batch(initial, physical, betas, frames, sample_dt, burn_time, seed
             device_physical, device_betas, device_rng, device_rates, device_tree,
             device_affected, device_marked, *outputs, sample_dt, burn_time,
             leaf_count, device_clocks, device_cursors, device_partial, initialize,
-            _EVENTS_PER_LAUNCH,
+            _EVENTS_PER_LAUNCH, event_mode, device_trace, device_waits,
         )
         # One small progress transfer per event batch, never per event. Chunked
         # launches avoid monopolizing a display GPU for the whole simulation.
-        if np.all(device_cursors.copy_to_host() >= frames):
+        cursors = device_cursors.copy_to_host()
+        if np.any(cursors < 0):
+            raise ValueError("The chain absorbed before the requested event count; event pairs cannot be padded.")
+        if np.all(cursors >= frames):
             break
         initialize = False
+    if event_mode:
+        return outputs[0].copy_to_host(), device_trace.copy_to_host(), outputs[2].copy_to_host()
     return tuple(array.copy_to_host() for array in outputs)
 
 
 def simulate_cuda(initial_states, physical, betas, n_frames, sample_dt, burn_time,
-                  seeds, *, batch_size=64, progress=False):
+                  seeds, *, batch_size=64, progress=False, event_mode=False,
+                  event_warmup=0):
     """Internal CUDA counterpart to repeated ``_simulate_single`` calls.
 
     Inputs are validated by the public ``simulate_ensemble`` API. ``batch_size``
     is an upper bound on simultaneous replicas, automatically reduced when
     device memory information is available. A replica's RNG state depends only
     on its seed, not its position within a chunk. All replicas retain their own
-    Gillespie clocks and use the same fixed physical observation schedule.
+    Gillespie clocks. Event mode saves exactly one transition per pair and
+    discards event_warmup frames within each chunk before assembling outputs.
+    It returns states, sparse event traces, shell entropy, and start offsets;
+    fixed-time mode retains the original five-array return signature.
     """
     if isinstance(batch_size, (bool, np.bool_)) or not isinstance(batch_size, Integral) or batch_size < 1:
         raise ValueError("batch_size must be a positive integer")
@@ -424,7 +468,7 @@ def simulate_cuda(initial_states, physical, betas, n_frames, sample_dt, burn_tim
     if not config.ENABLE_CUDASIM:
         maximum = int(np.max(np.sum(initial_states >= 0, axis=(1, 2))))
         leaves = 1 << (maximum - 1).bit_length()
-        per_replica = _device_bytes_per_replica(size, maximum, n_frames, shells, leaves)
+        per_replica = _device_bytes_per_replica(size, maximum, n_frames, shells, leaves, event_mode)
         free_bytes, _ = runtime.current_context().get_memory_info()
         # Reserve room for compilation/runtime allocations and other consumers.
         budget = int(free_bytes * 0.7)
@@ -434,21 +478,36 @@ def simulate_cuda(initial_states, physical, betas, n_frames, sample_dt, burn_tim
                 "device memory; reduce n_frames/lattice_size or use backend='cpu'"
             )
         batch_size = min(batch_size, max(1, budget // per_replica))
-    outputs = (
-        np.empty((count, n_frames, size, size), dtype=np.int8),
-        np.empty((count, n_frames - 1, size, size), dtype=np.float64),
-        np.empty((count, n_frames - 1, shells), dtype=np.float64),
-        np.empty((count, n_frames - 1), dtype=np.int64),
-        np.empty((count, n_frames - 1), dtype=np.int64),
-    )
-    with tqdm(total=count, desc="LABP-M CUDA Gillespie replicas", disable=not progress) as bar:
+    if event_mode:
+        kept_frames = n_frames - event_warmup
+        outputs = (
+            np.empty((count, kept_frames, size, size), dtype=np.int8),
+            np.empty((count, kept_frames - 1, 9), dtype=np.float64),
+            np.empty((count, kept_frames - 1, shells), dtype=np.float64),
+            np.empty(count, dtype=np.float64),
+        )
+    else:
+        outputs = (
+            np.empty((count, n_frames, size, size), dtype=np.int8),
+            np.empty((count, n_frames - 1, size, size), dtype=np.float64),
+            np.empty((count, n_frames - 1, shells), dtype=np.float64),
+            np.empty((count, n_frames - 1), dtype=np.int64),
+            np.empty((count, n_frames - 1), dtype=np.int64),
+        )
+    description = "LABP-M CUDA event replicas" if event_mode else "LABP-M CUDA Gillespie replicas"
+    with tqdm(total=count, desc=description, disable=not progress) as bar:
         for start in range(0, count, batch_size):
             stop = min(start + batch_size, count)
             result = _simulate_batch(
                 initial_states[start:stop], physical, betas, n_frames, sample_dt,
-                burn_time, seeds[start:stop],
+                burn_time, seeds[start:stop], event_mode=event_mode,
             )
-            for output, chunk in zip(outputs, result):
-                output[start:stop] = chunk
+            if event_mode:
+                for output, chunk in zip(outputs[:3], result):
+                    output[start:stop] = chunk[:, event_warmup:]
+                outputs[3][start:stop] = result[1][:, event_warmup - 1, 8] if event_warmup else 0.0
+            else:
+                for output, chunk in zip(outputs, result):
+                    output[start:stop] = chunk
             bar.update(stop - start)
     return outputs

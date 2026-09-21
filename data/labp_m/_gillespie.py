@@ -86,7 +86,7 @@ def _wait(total):
 
 @njit(cache=True, nogil=True)
 def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, seed,
-                     waiting_trace=None):
+                     waiting_trace=None, event_trace=None):
     np.random.seed(seed)
     size = initial.shape[0]
     n_particles = int(np.sum(initial >= 0))
@@ -114,7 +114,8 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
 
     radius = len(betas) + 1
     states = np.full((n_frames, size, size), -1, dtype=np.int8)
-    ep_maps = np.zeros((n_frames - 1, size, size), dtype=np.float64)
+    # Event sampling stores sparse endpoints instead of a mostly-zero dense map.
+    ep_maps = np.zeros((0 if event_trace is not None else n_frames - 1, size, size), dtype=np.float64)
     shell_ep = np.zeros((n_frames - 1, radius + 1), dtype=np.float64)
     hops = np.zeros(n_frames - 1, dtype=np.int64)
     rotations = np.zeros(n_frames - 1, dtype=np.int64)
@@ -129,6 +130,8 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
     for frame in range(n_frames):
         target = burn_time + frame * sample_dt
         interval = frame - 1
+        if event_trace is not None and interval >= 0:
+            target = np.inf
         while next_event_time <= target and math.isfinite(next_event_time):
             event_time = next_event_time
             mass = np.random.random() * tree[1]
@@ -146,6 +149,17 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
                 if mass < cumulative:
                     event = candidate
                     break
+
+            if event_trace is not None and interval >= 0:
+                # tau, pre-jump escape rate, event type, source row/col,
+                # target row/col, medium entropy, absolute event time.
+                event_trace[interval, 0] = pending_wait
+                event_trace[interval, 1] = tree[1]
+                event_trace[interval, 2] = event
+                event_trace[interval, 3] = sites[particle, 0]
+                event_trace[interval, 4] = sites[particle, 1]
+                event_trace[interval, 7] = 0.0
+                event_trace[interval, 8] = event_time
 
             if waiting_trace is not None and trace_count < len(waiting_trace):
                 # Record the rate that generated this waiting time, before
@@ -200,8 +214,11 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
                 if interval >= 0:
                     hops[interval] += 1
                     # Symmetric endpoint gauge negates under hop reversal.
-                    ep_maps[interval, row, col] += 0.5 * entropy
-                    ep_maps[interval, new_row, new_col] += 0.5 * entropy
+                    if event_trace is None:
+                        ep_maps[interval, row, col] += 0.5 * entropy
+                        ep_maps[interval, new_row, new_col] += 0.5 * entropy
+                    else:
+                        event_trace[interval, 7] = entropy
                     shell_ep[interval] += contribution
 
                 affected[0] = particle
@@ -228,8 +245,15 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
             # Keep the next event pending across observation boundaries.
             pending_wait = _wait(tree[1])
             next_event_time = event_time + pending_wait
+            if event_trace is not None and interval >= 0:
+                event_trace[interval, 5] = sites[particle, 0]
+                event_trace[interval, 6] = sites[particle, 1]
+                break  # Exactly one transition between each saved state pair.
             if waiting_trace is not None and n_frames == 1 and trace_count == len(waiting_trace):
                 break
+
+        if event_trace is not None and interval >= 0 and hops[interval] + rotations[interval] == 0:
+            raise ValueError("The chain absorbed before the requested event count; event pairs cannot be padded.")
 
         for particle in range(n_particles):
             row, col = sites[particle]

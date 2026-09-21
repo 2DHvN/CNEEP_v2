@@ -108,9 +108,9 @@ alone is not sufficient. Rates, clocks, and entropy use float64 on both
 backends. GPU throughput depends on the device, number of replicas, lattice
 size, and output volume; a small ensemble can be faster on CPU.
 
-Both notebooks expose `SIMULATION_BACKEND` (environment override
-`LABPM_BACKEND`, default `auto`), `CUDA_BATCH_SIZE`, and `WORKERS` (default
-`None`, all available CPUs; environment override `LABPM_WORKERS`). The training
+Both notebooks accept `LABPM_BACKEND` (default `auto`) and expose
+`CUDA_BATCH_SIZE` and `WORKERS` (default `None`, all available CPUs;
+environment override `LABPM_WORKERS`). The training
 notebook records the resolved simulation backend and simulator source hashes
 in its cache metadata, independently of its PyTorch training device.
 
@@ -162,50 +162,92 @@ architecture, and is not guaranteed to equal this microscopic decomposition.
 without changing the supplied particles. Event indices are forward, backward,
 left, right, turn left, turn right.
 
-## Training notebook
+## Training notebook: actual transition pairs
 
-Open [Corr_labpm.ipynb](../../notebooks/Corr_labpm.ipynb). It defaults to **100
-training replicas x 1000 adjacent intervals** (1001 saved frames per replica),
-plus 20 validation and 20 test replicas with distinct seeds. It matches the
-saved sanity-check physics: L=30, density 0.4, forward rate 8, backward/lateral
-rates 0.1, each rotation rate 0.01, and shell weights (1, 2, 3). Each trajectory
-is relaxed for **5000 physical time units** before data collection.
+Open [Corr_labpm.ipynb](../../notebooks/Corr_labpm.ipynb). It now trains on
+**one actual Gillespie transition per adjacent pair**, including hops and
+rotations. There is no fixed sampling lag or pilot sampling calibration.
+`N_EVENTS` is the number of transitions per replica; `N_FRAMES=N_EVENTS+1`.
+The notebook preserves its configured physics, ensemble sizes, and optimizer
+settings. The current saved settings request 1024 training replicas, 256
+validation replicas, 10 test replicas, and 1024 transitions each.
 
-`TARGET_EVENTS_PER_INTERVAL=3` sets the desired average number of total-system
-hops plus rotations between snapshots. A separate 16-replica pilot, with the
-same burn time and 200 time units of observation per replica, estimates the
-pooled event rate from total counts / total replica-time. The notebook sets
-`SAMPLE_DT = TARGET_EVENTS_PER_INTERVAL / measured_event_rate`, then uses this
-single fixed lag for every train/validation/test pair. Counts vary naturally;
-there is no selection of intervals with exactly three events. Pilot summaries
-and dataset caches retain their seeds, physics, backend, and simulator hash.
+Both physical burn-in (`BURN_TIME=5000`) and transition recording use the
+selected CPU/CUDA backend. `LABPM_BACKEND=auto` selects CUDA when available;
+set it to `cuda` to require a GPU or `cpu` to use CPU replica threads. Each
+CUDA block runs an independent exact SSA trajectory. Its event loop, rates,
+RNG, states, waiting times and sparse entropy records stay on the device.
+Completed records transfer in replica batches, with only a small progress
+transfer between bounded kernel launches. Pending waits and RNG state survive
+launch boundaries, preserving exactly the same path. `LABPM_CUDA_BATCH_SIZE`
+sets the notebook's maximum simultaneous replicas (default 1024); the launcher
+reduces this limit automatically to fit available GPU memory.
+`EVENT_WARMUP=128` additional transitions are discarded before collection,
+including the first event after the physical-time burn boundary. Subsequent
+waiting times are complete inter-event holding times. This event warm-up
+helps relax the embedded jump chain; inspect drift for slowly mixing runs.
+PyTorch training can use CUDA independently of the recording backend. CPU and
+CUDA paths differ because they use different RNGs; CUDA batch size does not
+change its seeded paths. Explicit CUDA requests and CUDA execution failures
+never silently fall back to CPU.
 
-Set `SAMPLE_DT_OVERRIDE` to a positive value to bypass calibration.
-`N_INTERVALS` fixes dataset size, `N_FRAMES = N_INTERVALS + 1`, and
-`OBSERVATION_TIME = N_INTERVALS * SAMPLE_DT` is derived. With the saved physics,
-a CPU pilot measured rate 88.8953/time, giving `SAMPLE_DT` about 0.03375 and
-about 33.75 time units per training trajectory. The measured lag can differ
-with a different pilot/backend. Sampling diagnostics report actual count
-means, replica uncertainty, zero-event frequency, and quantiles for each split.
-Gillespie waiting times remain variable internally; a frame without events
-repeats the state and no interpolation is performed.
+The event sampler is also available directly:
 
-Pairs never cross replica boundaries. Compact int8 trajectories stay on the
-CPU; the four directional occupancy channels are constructed only for the
-current minibatch. This avoids allocating the entire 100 x 1001 x 4 x 30 x 30
-float32 training video (about 1.34 GiB). Exact entropy maps still occupy host
-memory. The model uses exclusive Chebyshev shell branches. `LABPM_CACHE_DIR`
-can override the default `data/labp_m/cache` directory.
+```python
+from data.labp_m import LABPMConfig, simulate_event_ensemble
 
-The notebook compares held-out observed irreversibility with event-path EP.
-Fixed-time frames hide intermediate events, so their inferred irreversibility
-need not recover all the path EP. Local maps and individual learned shell
-contributions are descriptive and can be signed. The network returns spatial
-means; the notebook multiplies branch scores by `L*L` before the NEEP objective
-and sums raw local maps for full-system entropy. Its final force heads start
-at zero, giving the zero-score baseline without lattice-size-dependent forces.
-`LABPM_SMOKE=1` selects a short end-to-end
-simulation/training/plotting run for validation, not scientific conclusions.
+events = simulate_event_ensemble(
+    LABPMConfig(), n_trajectories=100, n_events=1024,
+    burn_time=5000, event_warmup=128, seed=17, workers=None,
+    backend="auto", batch_size=1024,
+)
+# events.states: [M,E+1,L,L], events.waiting_times: [M,E]
+# events.times: [M,E+1], a different physical clock for each replica
+```
+
+The API's `backend` controls recording and, by default, burn-in too. Optional
+`burn_backend` overrides only burn-in. Event recording allocates sparse
+entropy endpoints instead of a dense lattice entropy map per transition.
+For a performance comparison on the target GPU (after compilation, including
+output transfers), run:
+
+```text
+python -m data.labp_m.benchmark --sampling event --events 1024 --event-warmup 128 --lattice-size 30 --replicas 256 1024 --workers 1 8 --batch-size 1024
+```
+
+The benchmark uses `LABPMConfig`'s default physics unless changed in its source;
+it is not a timing of the notebook's stronger interaction coefficients.
+
+The loss samples transitions uniformly, without waiting-time weighting or
+division. This samples the embedded jump chain, whose stationary probability
+is proportional to physical stationary probability times escape rate.
+For a stationary event chain, the forward/reverse joint event probability
+ratio equals the stationary flux ratio because the escape-rate factors
+cancel. The optimal score includes a stationary-distribution boundary term;
+individual model medium-entropy increments are diagnostic references, not
+supervised labels. Removing hidden multi-event paths does not guarantee
+recovery with a restricted shell-force architecture or finite data.
+
+Entropy per event and entropy per physical time are reported separately.
+For a trajectory, the rate is **sum of entropy / sum of waiting times**,
+never the average of entropy divided by individual waits. A pooled ratio of
+sums is also reported. The cumulative plot uses event index because different
+replicas have different physical clocks. Error bars use independent replicas.
+
+`LABPMEventResult` stores compact int8 states, waits, per-event escape rates,
+event types, source/target coordinates, exact medium/shell entropy, event RNG
+seeds, burn-in seeds, and collection start times. Dense `medium_ep_maps` are
+materialized on demand from sparse endpoints, normally only for held-out
+plots. Absorption before the requested event count raises an error instead
+of manufacturing no-change pairs. One-hot channels are created per minibatch.
+
+Event caches use a separate schema and filename prefix, so fixed-time
+datasets cannot accidentally be reused. Cache keys include the event count,
+warm-up, physical burn-in and backend, seeds, and simulator source hash.
+`LABPM_CACHE_DIR` overrides `data/labp_m/cache`. Summary/checkpoint metadata
+records the event sampling convention. The network still multiplies spatial
+mean branch scores by `L*L`, uses raw local entropy maps, and starts with zero
+final force heads. `LABPM_SMOKE=1` runs a short end-to-end execution check.
 
 ## MIPS sanity notebook
 
@@ -247,11 +289,13 @@ Run simulator tests from the project directory:
 ```text
 python -m unittest discover -s tests -p test_labp_m.py
 python -m unittest discover -s tests -p test_labp_m_cuda.py
+python -m unittest discover -s tests -p test_labpm_events.py
+python -m unittest discover -s tests -p test_labpm_events_cuda.py
 ```
 
 CUDA-specific tests skip when no device is available. For a small correctness
 check without GPU hardware, start a **fresh** process with
-`NUMBA_ENABLE_CUDASIM=1` and run the second command. Numba's CUDA simulator
+`NUMBA_ENABLE_CUDASIM=1` and run the CUDA test commands. Numba's CUDA simulator
 checks the algorithm and thread coordination; it does not validate device
 compilation or measure real GPU performance. The benchmark rejects simulated
 CUDA timings.
