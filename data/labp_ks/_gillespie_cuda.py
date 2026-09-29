@@ -15,11 +15,11 @@ depend on chunk size. Its seeded paths differ from the CPU MT19937 backend.
 
 Each exclusive Chebyshev shell senses neighboring heading channels c+1 and
 c-1 with weights (1+chi)/2 and (1-chi)/2. Only forward propulsion changes:
-forward = backward + (baseline_forward-backward)*exp(sum(shell_gains)).
+forward = baseline_forward*exp(sum(shell_gains)).
 Translation noise, lateral rates, and rotation rates remain fixed. Rotation
 events therefore have zero medium EP but still invalidate nearby sensing
-rates. Nonlinear log-rate gains are allocated proportionally to shell gains;
-these shell labels are a reporting convention, not unique learning targets.
+rates. Shell gains provide an exact algebraic log-rate decomposition; they are
+not unique physical localization labels or learning targets.
 """
 
 from functools import lru_cache
@@ -122,7 +122,7 @@ def _get_kernel():
     @cuda.jit(device=True)
     def shell_gain(replica, row, col, orientation, index, occupancy,
                    orientations, size, physical, betas):
-        """Full Chebyshev shell with cyclic, direction-channel sensing."""
+        """Full Chebyshev shell with angular or orientation-blind sensing."""
         if betas[index] == 0.0:
             return 0.0
         radius = index + 2
@@ -137,11 +137,14 @@ def _get_kernel():
                 cc = (col + dc_ + size) % size
                 other = occupancy[replica, rr, cc]
                 if other >= 0:
-                    other_orientation = orientations[replica, other]
-                    if other_orientation == plus:
-                        sensed += 0.5 * (1.0 + physical[5])
-                    elif other_orientation == minus:
-                        sensed += 0.5 * (1.0 - physical[5])
+                    if physical[6] == 0.0:
+                        sensed += 1.0
+                    else:
+                        other_orientation = orientations[replica, other]
+                        if other_orientation == plus:
+                            sensed += 0.5 * (1.0 + physical[5])
+                        elif other_orientation == minus:
+                            sensed += 0.5 * (1.0 - physical[5])
         return betas[index] * (-math.expm1(-sensed / physical[4]))
 
     @cuda.jit(device=True)
@@ -155,12 +158,7 @@ def _get_kernel():
 
     @cuda.jit(device=True)
     def boosted_forward_rate(physical, gain):
-        propulsion = physical[0] - physical[1]
-        if propulsion == 0.0:
-            return physical[1]
-        # Avoid exp(gain) overflowing when a small baseline propulsion still
-        # makes the final physical rate representable in float64.
-        return physical[1] + math.exp(math.log(propulsion) + gain)
+        return math.exp(math.log(physical[0]) + gain)
 
     @cuda.jit(device=True)
     def particle_rate(replica, particle, event, sites, orientations, occupancy,
@@ -198,20 +196,12 @@ def _get_kernel():
     def add_shell_entropy(replica, interval, row, col, orientation, sign,
                           occupancy, orientations, size, physical, betas,
                           shell_ep):
-        """Allocate the nonlinear log-rate boost proportionally to shell gains.
-
-        These labels sum to medium EP; they are not unique shell observables.
-        """
-        shell_ep[replica, interval, 0] += sign * (math.log(physical[0]) - math.log(physical[1]))
-        gain = sensing_gain(replica, row, col, orientation, occupancy,
-                            orientations, size, physical, betas)
-        if gain > 0.0:
-            forward = boosted_forward_rate(physical, gain)
-            log_boost = math.log(forward) - math.log(physical[0])
-            for index in range(betas.size):
-                part = shell_gain(replica, row, col, orientation, index,
-                                  occupancy, orientations, size, physical, betas)
-                shell_ep[replica, interval, index + 2] += sign * (part / gain) * log_boost
+        """Allocate the exact baseline-plus-shell-gain log-rate decomposition."""
+        shell_ep[replica, interval, 1] += sign * (math.log(physical[0]) - math.log(physical[1]))
+        for index in range(betas.size):
+            part = shell_gain(replica, row, col, orientation, index,
+                              occupancy, orientations, size, physical, betas)
+            shell_ep[replica, interval, index + 2] += sign * part
 
     @cuda.jit
     def kernel(sites, orientations, occupancy, particle_counts, physical, betas,

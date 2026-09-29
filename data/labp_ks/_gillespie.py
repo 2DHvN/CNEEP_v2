@@ -22,6 +22,7 @@ def _sensing_contributions(sites, orientations, occupancy, particle, size, physi
     """Saturated full-shell responses, indexed by k - 2 (never ray sensing)."""
     row, col = sites[particle]
     orientation = orientations[particle]
+    angular_sensing = physical[6] != 0.0
     clockwise = (orientation + 1) % 4
     counterclockwise = (orientation - 1) % 4
     plus_weight = (1.0 + physical[5]) * 0.5
@@ -31,6 +32,7 @@ def _sensing_contributions(sites, orientations, occupancy, particle, size, physi
         if betas[index] == 0.0:
             continue
         distance = index + 2
+        count = 0
         count_plus = 0
         count_minus = 0
         # Top/bottom contain the corners; left/right exclude the corners.
@@ -39,46 +41,41 @@ def _sensing_contributions(sites, orientations, occupancy, particle, size, physi
             for dc in range(-distance, distance + 1):
                 other = occupancy[(row + dr) % size, (col + dc) % size]
                 if other >= 0:
-                    count_plus += orientations[other] == clockwise
-                    count_minus += orientations[other] == counterclockwise
+                    if angular_sensing:
+                        count_plus += orientations[other] == clockwise
+                        count_minus += orientations[other] == counterclockwise
+                    else:
+                        count += 1
         for side in range(2):
             dc = -distance if side == 0 else distance
             for dr in range(-distance + 1, distance):
                 other = occupancy[(row + dr) % size, (col + dc) % size]
                 if other >= 0:
-                    count_plus += orientations[other] == clockwise
-                    count_minus += orientations[other] == counterclockwise
-        q = (plus_weight * count_plus + minus_weight * count_minus) / physical[4]
+                    if angular_sensing:
+                        count_plus += orientations[other] == clockwise
+                        count_minus += orientations[other] == counterclockwise
+                    else:
+                        count += 1
+        sensed = plus_weight * count_plus + minus_weight * count_minus if angular_sensing else count
+        q = sensed / physical[4]
         values[index] = betas[index] * (-math.expm1(-q))
     return values
 
 
 @njit(cache=True, nogil=True)
 def _boosted_forward_rate(physical, exponent):
-    propulsion = physical[0] - physical[1]
-    if propulsion == 0.0:
-        return physical[1]
-    # The product can be finite even when exp(exponent) itself overflows.
-    return physical[1] + math.exp(math.log(propulsion) + exponent)
+    return math.exp(math.log(physical[0]) + exponent)
 
 
 @njit(cache=True, nogil=True)
 def _shell_allocation(sites, orientations, occupancy, particle, size, physical, betas, sign):
-    """Diagnostic proportional allocation; its sum equals the hop affinity.
-
-    Fixed diffusion makes log(w_plus / forward_rate) nonlinear in the summed
-    sensing exponent. Distributing it proportionally to G_k is a convention,
-    not a uniquely defined physical entropy production in individual shells.
-    """
+    """Exact log-rate allocation: baseline in k=1 and signed G_k in k>=2."""
     values = _sensing_contributions(sites, orientations, occupancy, particle,
                                    size, physical, betas)
     result = np.zeros(len(betas) + 2, dtype=np.float64)
-    result[0] = sign * (math.log(physical[0]) - math.log(physical[1]))
-    exponent = values.sum()
-    if exponent > 0.0:
-        boost = math.log(_boosted_forward_rate(physical, exponent)) - math.log(physical[0])
-        for index in range(len(betas)):
-            result[index + 2] = sign * values[index] / exponent * boost
+    result[1] = sign * (math.log(physical[0]) - math.log(physical[1]))
+    for index in range(len(betas)):
+        result[index + 2] = sign * values[index]
     return result
 
 

@@ -148,14 +148,15 @@ With `M` replicas and `T` frames:
 | `times` | `[T]` | observation times relative to burn-in |
 | `medium_ep` | `[M,T-1]` | sum of actual hop log-rate ratios |
 | `medium_ep_maps` | `[M,T-1,L,L]` | half each hop contribution at each endpoint |
-| `shell_ep` | `[M,T-1,R+1]` | baseline in slot 0; interaction terms in 2..R |
+| `shell_ep` | `[M,T-1,R+1]` | baseline in slot 1; interaction terms in 2..R |
 | `hop_counts`, `rotation_counts` | `[M,T-1]` | actual event counts |
 | `seeds` | `[M]` | compiled trajectory RNG seeds |
 
 Maps sum to `medium_ep`; shell terms sum to it up to floating-point rounding.
-Slot 1 is zero: immediate exclusion is a rate constraint, not a separate log
-rate term. The microscopic baseline slot 0 is not identified with the learned
-KNEEP local branch. Learned shell allocation depends on the observation and
+Slot 0 is zero: it is reserved for the local model branch, while immediate
+exclusion is a rate constraint rather than a separate log-rate term. The
+microscopic baseline slot 1 is not identified with the learned KNEEP local
+branch. Learned shell allocation depends on the observation and
 architecture, and is not guaranteed to equal this microscopic decomposition.
 
 `event_rates` and `event_medium_ep` expose small-state reference calculations

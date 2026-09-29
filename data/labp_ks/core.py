@@ -1,9 +1,11 @@
 """Four-direction kernel-sensing lattice ABP with exact Gillespie SSA.
 
-Each exclusive Chebyshev shell counts neighboring headings c+1 and c-1 with
-weights (1+angular_bias)/2 and (1-angular_bias)/2. A saturated shell response
-G_k=beta_k*(1-exp(-weighted_count/sensing_scale)) boosts propulsion only:
-w_plus=backward_rate+(forward_rate-backward_rate)*exp(sum G_k).
+In ``angular`` sensing mode, each exclusive Chebyshev shell counts neighboring
+headings c+1 and c-1 with weights (1+angular_bias)/2 and
+(1-angular_bias)/2. In ``occupancy`` mode it instead counts every occupied
+site in the shell, independently of either particle's heading. A saturated
+shell response G_k=beta_k*(1-exp(-weighted_count/sensing_scale)) boosts the
+forward hopping rate as w_plus=forward_rate*exp(sum G_k).
 Backward/lateral and both rotation rates remain constant. Occupied destinations
 are forbidden. Positions and fields use (row, column); headings are clockwise,
 0=up, 1=right, 2=down, 3=left. angular_bias=1 senses only the next heading.
@@ -55,8 +57,10 @@ class LABPKSConfig:
 
     shell_weights[j] acts on the complete exclusive shell at distance j+2.
     sensing_scale is a positive weighted neighbor-count scale; counts are not
-    divided by shell perimeter. angular_bias in [-1,1] interpolates clockwise
-    and counterclockwise heading selection, with equal weights at zero.
+    divided by shell perimeter. sensing_mode is ``angular`` (the default) or
+    ``occupancy``. angular_bias in [-1,1] interpolates clockwise and
+    counterclockwise heading selection, with equal weights at zero, and is
+    ignored in occupancy mode.
     The angular matrix is reciprocal at zero, which does not make the entire
     active process reversible. An empty tuple disables sensing. The cutoff
     must be below half the periodic side to avoid duplicated wrapped sites.
@@ -73,6 +77,7 @@ class LABPKSConfig:
     shell_weights: tuple[float, ...] = (0.0, 1.0, 0.0)
     sensing_scale: float = 1.0
     angular_bias: float = 1.0
+    sensing_mode: str = "angular"
 
     def __post_init__(self):
         object.__setattr__(self, "lattice_size", _integer("lattice_size", self.lattice_size, 3))
@@ -83,13 +88,17 @@ class LABPKSConfig:
             object.__setattr__(self, name, value)
         if self.density > 1.0:
             raise ValueError("density must lie in (0, 1]")
-        if self.forward_rate < self.backward_rate:
-            raise ValueError("forward_rate must be >= backward_rate (nonnegative propulsion)")
         object.__setattr__(self, "sensing_scale", _scalar("sensing_scale", self.sensing_scale, strict=True))
         bias = _scalar("angular_bias", self.angular_bias, minimum=-1.0)
         if bias > 1.0:
             raise ValueError("angular_bias must lie in [-1, 1]")
         object.__setattr__(self, "angular_bias", bias)
+        if not isinstance(self.sensing_mode, str):
+            raise ValueError("sensing_mode must be 'angular' or 'occupancy'")
+        mode = self.sensing_mode.strip().lower()
+        if mode not in {"angular", "occupancy"}:
+            raise ValueError("sensing_mode must be 'angular' or 'occupancy'")
+        object.__setattr__(self, "sensing_mode", mode)
         try:
             weights = tuple(_scalar("shell weight", x) for x in self.shell_weights)
         except TypeError as exc:
@@ -103,10 +112,7 @@ class LABPKSConfig:
             summed_weights = math.fsum(weights)
             if not math.isfinite(summed_weights):
                 raise ValueError("sum of shell_weights must be finite")
-            propulsion = self.forward_rate - self.backward_rate
-            maximum_forward = self.backward_rate
-            if propulsion > 0.0:
-                maximum_forward += math.exp(math.log(propulsion) + summed_weights)
+            maximum_forward = math.exp(math.log(self.forward_rate) + summed_weights)
             maximum = maximum_forward + self.backward_rate + 2 * self.lateral_rate + 2 * self.rotation_rate
         except OverflowError as exc:
             raise ValueError("maximum hopping rate must be finite") from exc
@@ -125,7 +131,8 @@ class LABPKSConfig:
         return (
             np.array([self.forward_rate, self.backward_rate, self.lateral_rate,
                       self.rotation_rate, self.sensing_scale,
-                      self.angular_bias], dtype=np.float64),
+                      self.angular_bias,
+                      float(self.sensing_mode == "angular")], dtype=np.float64),
             np.asarray(self.shell_weights, dtype=np.float64),
         )
 
@@ -138,10 +145,10 @@ class LABPKSResult:
     to burn-in. medium_ep: [M,T-1], event-path EP in each saved interval.
     medium_ep_maps: [M,T-1,L,L], half the hop EP on each endpoint.
     shell_ep: [M,T-1,R+1], signed baseline log(forward_rate/backward_rate)
-    in slot 0. Slots 2..R allocate the signed log(w_plus/forward_rate) in
-    proportion to G_k/sum(G_k), with zero boost when sum(G_k)=0. This is a
-    diagnostic allocation convention, NOT unique physical shell entropy or
-    target labels for the learned spatial shell spectrum. It sums to medium_ep.
+    in slot 1. Slots 2..R contain the signed shell gains G_k exactly, so their
+    sum with the baseline is the realized hop log-rate ratio. This algebraic
+    decomposition is not a unique physical localization or target label for
+    the learned spatial shell spectrum.
     hop_counts, rotation_counts: int64 [M,T-1]. seeds: uint32 [M].
     Frame zero is the state at burn_time; all burn-in EP is discarded.
     """

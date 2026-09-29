@@ -116,7 +116,7 @@ class LABPMResult:
     states: int8 [M,T,L,L], -1 empty, 0..3 orientation. times: [T], relative
     to burn-in. medium_ep: [M,T-1], event-path EP in each saved interval.
     medium_ep_maps: [M,T-1,L,L], half the hop EP on each endpoint.
-    shell_ep: [M,T-1,R+1], baseline log(v_plus/v_minus) in slot 0; the
+    shell_ep: [M,T-1,R+1], baseline log(v_plus/v_minus) in slot 1; the
     signed beta_k terms in slots 2..R. This microscopic decomposition is NOT
     uniquely identified with the learned spatial shell spectrum.
     hop_counts, rotation_counts: int64 [M,T-1]. seeds: uint32 [M].
@@ -188,7 +188,7 @@ def event_medium_ep(config, sites, orientations, particle, event):
     direction = (orientation + RELATIVE_DIRECTIONS[event]) % 4
     target = (sites[particle] + np.array([DR[direction], DC[direction]])) % config.lattice_size
     if event == 0:
-        pieces[0] = math.log(config.forward_rate) - math.log(config.backward_rate)
+        pieces[1] = math.log(config.forward_rate) - math.log(config.backward_rate)
         for index, beta in enumerate(betas):
             k = index + 2
             rr = (row + k * DR[orientation]) % config.lattice_size
@@ -200,7 +200,7 @@ def event_medium_ep(config, sites, orientations, particle, event):
     reverse = _particle_rates(sites, orientations, occupancy, particle,
                               config.lattice_size, physical, betas)[(1, 0, 3, 2)[event]]
     if event == 1:
-        pieces[0] = math.log(config.backward_rate) - math.log(config.forward_rate)
+        pieces[1] = math.log(config.backward_rate) - math.log(config.forward_rate)
         for index, beta in enumerate(betas):
             k = index + 2
             rr = (target[0] + k * DR[orientation]) % config.lattice_size

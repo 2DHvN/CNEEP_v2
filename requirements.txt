@@ -1,11 +1,23 @@
-# General project environment. For the L40S lattice-ABP notebook, use
-# data/lattice_abp_tc/requirements-l40s.txt and install CUDA PyTorch separately.
+# Python 3.12 environment for Corr_labpks / LABP-KS.
+# numba-cuda currently registers its np.row_stack overload under NumPy 2.5,
+# where that alias was removed. Pin NumPy below 2.5 until its upstream fix is
+# released. Numba 0.67 supports this range and requires llvmlite 0.49.x.
+numpy==2.4.4
+numba==0.67.0
+llvmlite==0.49.0
+
+# CUDA support for ``from numba import cuda``. The NVIDIA driver is installed
+# system-wide; install CUDA runtime/compiler packages with conda separately.
+numba-cuda
+cuda-python
+
+# PyTorch is installed separately with the CUDA wheel selected at
+# https://pytorch.org/get-started/locally/
 torch>=2.0
-numpy>=1.24
-numba>=0.60
 ninja>=1.11
 matplotlib>=3.7
 seaborn>=0.13
 tqdm>=4.66
 ipywidgets>=8.0
 pandas>=2.2
+scipy>=1.11

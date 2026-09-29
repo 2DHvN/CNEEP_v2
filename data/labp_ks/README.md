@@ -15,20 +15,20 @@ occlusion, force toward neighbors, or alignment torque.
 
 ```text
 q[k] = ((1 + angular_bias)/2 * n_plus[k]
-      + (1 - angular_bias)/2 * n_minus[k]) / sensing_scale
+      + (1 - angular_bias)/2 * n_minus[k]) / sensing_scale   # angular mode
+q[k] = n_occupied[k] / sensing_scale                           # occupancy mode
 G[k] = shell_weights[k-2] * (1 - exp(-q[k]))
-v0   = forward_rate - backward_rate
-w_forward = backward_rate + v0 * exp(sum(G))
+w_forward = forward_rate * exp(sum(G))
 w_backward = backward_rate
 w_left = w_right = lateral_rate
 w_turn_left = w_turn_right = rotation_rate
 ```
 
 Occupied hop destinations have rate zero. Rotation never changes a particle's
-position. `forward_rate` is the **total forward rate without sensing**, not the
-propulsion-only rate. With `backward_rate = lateral_rate = D`, the diffusive
-baseline `D` remains fixed; only propulsion changes. Discrete propulsion jumps
-still contribute shot noise, so this does not fix total displacement variance.
+position. `forward_rate` is the forward rate without sensing; backward,
+lateral, and rotation rates remain independent constant rates. In
+`occupancy` sensing mode every occupied site in the shell contributes one to
+`n_occupied`, regardless of its heading; `angular_bias` is then ignored.
 
 `shell_weights[j]` controls `k=j+2`. The default `(0, 1, 0)` activates only `k=3`.
 `sensing_scale` is a neighbor-count scale, not a perimeter normalization. All
@@ -49,9 +49,9 @@ There is no tau-leaping or simultaneous particle update.
 
 An event refreshes every potentially affected particle's rate: both spatial
 endpoint neighborhoods for a hop, and the entire sensing neighborhood for a
-rotation. The latter is essential because another particle's heading is part of
-the sensed field. Refreshing only the rotating particle would produce an
-incorrect CTMC even though its own rotation rate is constant.
+rotation. The latter is essential in angular mode because another particle's
+heading is part of the sensed field; the same conservative refresh is retained
+in occupancy mode.
 
 `simulate_ensemble` records states at fixed physical intervals, retaining pending
 events across observation boundaries. `simulate_event_ensemble` records exactly
@@ -71,13 +71,12 @@ sensing environment. Rotations have zero medium increment because their two
 rates are equal, although rotations affect later hopping rates. This is exact
 for the implemented model; it is not a claim of thermodynamic heat.
 
-`shell_ep` is an explicit diagnostic allocation. Slot zero contains the signed
-bare affinity `log(forward_rate/backward_rate)`. A forward hop allocates
-`log(w_forward/forward_rate)` to shell `k` in proportion to `G[k]/sum(G)`; a
-backward hop uses the negative allocation in the post-event state. When the
-sum is zero the allocation is zero. The slots sum to the exact medium increment,
-but are **not uniquely defined shell entropies or supervised spectrum labels**.
-The fixed diffusion floor makes the total log-rate boost nonlinear in `sum(G)`.
+`shell_ep` is an exact algebraic log-rate decomposition. Slot zero is reserved
+for the local model branch; slot one contains the signed bare affinity
+`log(forward_rate/backward_rate)`, and slots `k>=2` contain the signed shell
+gains `G[k]`. A backward hop uses the negative allocation in the post-event
+state. These slots sum to the exact medium increment, but are **not uniquely
+defined physical shell entropies or supervised spectrum labels**.
 
 For event training, sample pairs uniformly in events. Convert an accumulated
 score into a physical-time rate using `sum(score)/sum(waiting_times)`, never the

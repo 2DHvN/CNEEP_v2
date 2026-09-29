@@ -272,7 +272,7 @@ def _get_kernel():
                         new_col = (col + dc(direction) + size) % size
                         forward = rates[replica, particle, event]
                         if interval >= 0 and event == 0:
-                            shell_ep[replica, interval, 0] += baseline
+                            shell_ep[replica, interval, 1] += baseline
                             for beta_index in range(betas.size):
                                 distance = beta_index + 2
                                 rr = (row + distance * dr(orientation) + size) % size
@@ -298,7 +298,7 @@ def _get_kernel():
                                 ep_maps[replica, interval, row, col] += 0.5 * entropy
                                 ep_maps[replica, interval, new_row, new_col] += 0.5 * entropy
                             if event == 1:
-                                shell_ep[replica, interval, 0] -= baseline
+                                shell_ep[replica, interval, 1] -= baseline
                                 for beta_index in range(betas.size):
                                     distance = beta_index + 2
                                     rr = (new_row + distance * dr(orientation) + size) % size

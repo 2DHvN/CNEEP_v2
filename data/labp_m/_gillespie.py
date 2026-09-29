@@ -186,7 +186,7 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
                 forward_rate = rates[particle, event]
                 contribution[:] = 0.0
                 if event == 0:
-                    contribution[0] = baseline_affinity
+                    contribution[1] = baseline_affinity
                     for index in range(len(betas)):
                         distance = index + 2
                         rr = (row + distance * DR[orientation]) % size
@@ -204,7 +204,7 @@ def _simulate_single(initial, physical, betas, n_frames, sample_dt, burn_time, s
                 )
                 entropy = math.log(forward_rate) - math.log(new_rates[reverse_event])
                 if event == 1:
-                    contribution[0] = -baseline_affinity
+                    contribution[1] = -baseline_affinity
                     for index in range(len(betas)):
                         distance = index + 2
                         rr = (new_row + distance * DR[orientation]) % size

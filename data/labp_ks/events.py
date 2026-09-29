@@ -18,8 +18,8 @@ class LABPKSEventResult:
     [M,E,2] store sparse EP endpoints, and event_types [M,E] use indices 0..5.
     Rotations have equal source/target and zero medium EP. Medium entropy and
     shell entropy are event labels for diagnostics, not supervised targets.
-    Shell labels use a proportional G_k allocation of the nonlinear log-rate
-    boost; they are not a unique physical entropy decomposition.
+    Shell labels use the exact baseline-plus-G_k log-rate decomposition; they
+    are not a unique physical entropy decomposition.
     """
     states: np.ndarray
     times: np.ndarray
