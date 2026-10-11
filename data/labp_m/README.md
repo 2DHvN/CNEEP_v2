@@ -163,6 +163,29 @@ architecture, and is not guaranteed to equal this microscopic decomposition.
 without changing the supplied particles. Event indices are forward, backward,
 left, right, turn left, turn right.
 
+## Training notebook: fixed physical-time CTMC samples
+
+Open [Corr_labpm_ctmc.ipynb](../../notebooks/Corr_labpm_ctmc.ipynb) to train
+on adjacent frames from an exact Gillespie trajectory sampled every fixed
+physical `DELTA_T`. `simulate_ensemble` executes every actual event between
+the frames; `DELTA_T` is an output-sampling interval, not an integration time
+step. The notebook keeps no-event bins, multi-event bins, and bins whose
+endpoints happen to match after a closed excursion.
+
+Its `true_ep[m, j]` is `result.medium_ep[m, j]`: the exact sum of the model
+medium-entropy increments from all events in
+`(t_j, t_j + DELTA_T]`. It is asserted against both the dense endpoint map and
+the shell decomposition. Burn-in contributions are excluded. The alpha-NEEP
+loss uses only the sampled endpoint observations; `true_ep` is a held-out
+diagnostic rather than a supervised target, because a coarse endpoint pair can
+hide events and its optimal score includes a stationary endpoint term.
+
+Fixed-time train/validation/test replicas are independent. Caches have their
+own `fixed_time_ctmc` schema and include `DELTA_T`, frame count, burn-in,
+backend, seeds, and simulator hashes. Entropy rates divide a trajectory's
+summed increments by its common physical observation duration, and cumulative
+plots use the physical time grid.
+
 ## Training notebook: actual transition pairs
 
 Open [Corr_labpm.ipynb](../../notebooks/Corr_labpm.ipynb). It now trains on
@@ -261,16 +284,19 @@ using multiple replicas and matched initial configurations. It includes:
 - Late-time density histograms and radially averaged density structure factors.
 - Random configurations with identical particle count as a reference, and
   standard errors computed across independent replicas.
-- A final waiting-time diagnostic cell: exact whole-system inter-event PDF,
-  survival function, and the rescaled clock `a * tau` against `Exp(1)`.
+- A final post-burn-in waiting-time diagnostic cell: exact whole-system
+  inter-event PDF plus empirical survival function, with the `1/2`, `1/3`,
+  and `1/4` survival crossing times recorded in the summary.
 
-The waiting-time cell continues each case's final configurations using the
-CPU Gillespie kernel for `WAITING_EVENTS_PER_REPLICA=20000` complete intervals
-(256 in smoke mode). The first delay after each snapshot is discarded; samples
+The waiting-time cell continues each case from frame zero, the state exactly
+at the configured physical burn-in boundary, using the CPU Gillespie kernel
+for `WAITING_EVENTS_PER_REPLICA=20000` complete intervals (256 in smoke mode).
+The first forward-recurrence delay after that snapshot is discarded; samples
 include both hops and rotations. These are event-sampled continuation traces,
 not waiting times reconstructed from saved frames, per-particle residence
 times, or a time-weighted state distribution. Absorbing cases return fewer or
-no samples. Outputs are `waiting_time_distribution.png`,
+no samples. `BURN_TIME=0` means that no transient is removed, so increase it
+when an equilibrated waiting-time diagnostic is wanted. Outputs are `waiting_time_distribution.png`,
 `waiting_time_samples.npz` (with replica offsets, pre-event rates, and event
 types), and `waiting_time_summary.json` in the notebook's result directory.
 
