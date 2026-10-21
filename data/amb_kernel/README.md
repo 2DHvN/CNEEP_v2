@@ -20,13 +20,13 @@ Notebook 생성기는 `python scripts/make_amb_kernel_notebook.py`입니다. 생
 
 | Split | 독립 trajectory | trajectory당 frame | lag=1 pair 수 |
 |---|---:|---:|---:|
-| Train | 1,024 | 1,025 | 1,048,576 |
-| Validation | 256 | 1,025 | 262,144 |
-| Test | 10 | 1,025 | 10,240 |
+| Train | 1,024 | 1,001 | 1,024,000 |
+| Validation | 256 | 1,001 | 256,000 |
+| Test | 10 | 1,001 | 10,000 |
 
-설정 위치는 notebook 학습 cell의 `TRAIN_M`, `VAL_M`, `TEST_M`, `N_INTERVALS`입니다. `TRAIN_N=32`, `BURN_IN_STEPS=10000`, `TRAIN_DT=0.001`, `TRAIN_OBSERVATION_STRIDE=1`이 기본입니다. Burn-in 10,000은 기존 AMB2D 실험을 참고한 출발값이며 각 모델의 stationarity와 correlation time에 맞춰 검증·조정해야 합니다.
+설정 위치는 notebook 학습 cell의 `TRAIN_M`, `VAL_M`, `TEST_M`, `N_INTERVALS`입니다. `TRAIN_N=32`, `BURN_IN_STEPS=10000`, `TRAIN_DT=0.01`, `N_INTERVALS=1000`, `TRAIN_OBSERVATION_STRIDE=1`이 기본입니다. Burn-in 물리 시간은 100, 학습용 trajectory의 측정 물리 시간은 10입니다. Dataset API에서 RunConfig를 생략해도 같은 dt를 사용합니다. 각 모델의 stationarity와 correlation time에 맞춰 검증·조정해야 합니다.
 
-32×32 float64 field 파일은 모델당 약 **10.09 GiB**(10.83 GB), 여섯 모델 약 60.5 GiB이며 진단/체크포인트 공간이 추가됩니다. 데이터 생성은 trajectory별로 저장하고 read-only memory map으로 재개합니다. 학습 정규화와 pair 접근도 부분적으로 읽으며, 모델 하나를 학습·평가한 뒤 map을 닫습니다. 그림에 필요한 test pair만 복사하므로 모든 모델의 전체 ensemble을 RAM에 올리지 않습니다.
+32×32 float64 field 파일은 모델당 약 **9.85 GiB**(10.58 GB), 여섯 모델 약 59.1 GiB이며 진단/체크포인트 공간이 추가됩니다. 데이터 생성은 trajectory별로 저장하고 read-only memory map으로 재개합니다. 학습 정규화와 pair 접근도 부분적으로 읽으며, 모델 하나를 학습·평가한 뒤 map을 닫습니다. 그림에 필요한 test pair만 복사하므로 모든 모델의 전체 ensemble을 RAM에 올리지 않습니다.
 
 학습 dataset 생성은 notebook의 `SIMULATION_DEVICE='auto'`로 CUDA 장치를 자동 선택하고, `SIMULATION_BATCH_SIZE=32`개의 독립 trajectory를 GPU batch로 함께 적분합니다. `'cpu'`는 기존 SciPy simulator를 선택하며 실제 병렬 batch 크기는 1입니다. `'cuda'`, `'cuda:0'`처럼 GPU를 명시하면 해당 장치를 사용할 수 없을 때 오류를 내고, `'auto'`일 때만 CPU를 선택할 수 있습니다. 선택한 backend/device와 batch 상한은 실행 전 표시되고 `training_plan.json`에 기록됩니다.
 
@@ -64,7 +64,7 @@ restored = load_experiment('results/amb_kernel/example_M01')
 ```python
 from data.amb_kernel.dataset import DatasetConfig, generate_dataset, load_dataset
 
-config = DatasetConfig()  # 1024/256/10 replicas, each 1024 intervals
+config = DatasetConfig()  # 1024/256/10 replicas, each 1000 intervals; default dt=0.01
 # config = DatasetConfig.smoke()  # explicit small execution check
 with generate_dataset(pilot_config('M01', n=32), 'results/amb_kernel_dataset/M01',
                       dataset_config=config, device='auto', simulation_batch_size=32,

@@ -1,8 +1,8 @@
 """Independent, disk-backed AMB replica datasets for the existing shell-force trainer.
 
 The production preset follows the LABPM sample counts: 1024 training replicas,
-256 validation replicas, and 10 test replicas, each with 1024 observation
-intervals (1025 frames). CUDA generates a batch of independent trajectories at
+256 validation replicas, and 10 test replicas, each with 1000 observation
+intervals (1001 frames). CUDA generates a batch of independent trajectories at
 once; CPU retains the reference solver. Saved replicas reopen as read-only
 memory maps; no multi-gigabyte ensemble is stacked in RAM.
 """
@@ -60,7 +60,7 @@ class DatasetConfig:
     train_count: int = 1024
     validation_count: int = 256
     test_count: int = 10
-    intervals: int = 1024
+    intervals: int = 1000
     burn_in_steps: int = 10000
     observation_stride: int = 1
     split_seeds: tuple[int, int, int] = (12031, 23041, 34057)
@@ -168,7 +168,7 @@ def _simulator_hashes(*, torch_backend: bool = False) -> dict[str, str]:
 
 def _run_template(config: DatasetConfig, template: RunConfig | None) -> RunConfig:
     if template is None:
-        template = RunConfig(observation_lags=tuple(config.observation_stride*k for k in (1, 4, 16)),
+        template = RunConfig(dt=0.01, observation_lags=tuple(config.observation_stride*k for k in (1, 4, 16)),
                              block_steps=min(1024, config.intervals*config.observation_stride))
     if not isinstance(template, RunConfig):
         raise TypeError("run_config must be a RunConfig or None.")
