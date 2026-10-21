@@ -14,3 +14,7 @@ __all__ = [
 from .experiment import ExperimentResult, RunConfig, SimulationFailure, load_experiment, run_experiment
 
 __all__ += ["ExperimentResult", "RunConfig", "SimulationFailure", "load_experiment", "run_experiment"]
+
+from .dataset import DatasetConfig, DatasetResult, generate_dataset, load_dataset, resolve_simulation_device
+
+__all__ += ["DatasetConfig", "DatasetResult", "generate_dataset", "load_dataset", "resolve_simulation_device"]

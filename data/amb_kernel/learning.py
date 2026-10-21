@@ -10,12 +10,14 @@ import csv
 import hashlib
 import json
 from pathlib import Path
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Mapping, Sequence
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 from models.NEEP_ShellForce_2D import MultiScaleShellForceCNEEP2D
 from .model import laplacian
@@ -56,21 +58,27 @@ class TrainingConfig:
     device: str = "cpu"
     dtype: str = "float64"
     lag_frames: int = 1
+    eval_batch_size: int | None = None
+    micro_batch_size: int | None = 32
 
     def __post_init__(self):
         if min(self.iterations, self.batch_size, self.record_every, self.lag_frames) < 1:
             raise ValueError("Iterations, batch, recording interval and lag must be positive.")
+        for name in ("eval_batch_size", "micro_batch_size"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+                raise ValueError(f"{name} must be a positive integer or None.")
         if self.dtype not in {"float32", "float64"}:
             raise ValueError("dtype must be float32 or float64.")
         if not -1 < self.alpha <= 0 or self.learning_rate <= 0 or self.clip_norm <= 0:
             raise ValueError("Require -1 < alpha <= 0, positive learning rate and clip norm.")
 
 
-def _fields(array):
+def _fields(array, *, check_finite=True):
     x = np.asarray(array)
     if x.ndim != 4 or x.shape[1] != 1 or x.shape[-1] != x.shape[-2]:
         raise ValueError("Expected scalar fields [time, 1, Ny, Nx] on a square lattice.")
-    if len(x) < 2 or not np.isfinite(x).all():
+    if len(x) < 2 or (check_finite and not np.isfinite(x).all()):
         raise ValueError("Need at least two finite frames.")
     return x
 
@@ -122,12 +130,28 @@ class AffineNormalizer:
     std: float
 
     @classmethod
-    def fit(cls, training_fields):
-        arrays = [_fields(x).astype(np.float64, copy=False) for x in training_fields]
-        count = sum(x.size for x in arrays)
-        mean = sum(float(x.sum()) for x in arrays) / count
-        variance = sum(float(np.square(x - mean).sum()) for x in arrays) / count
-        std = float(np.sqrt(variance))
+    def fit(cls, training_fields, *, show_progress=False, progress_desc="Train normalization"):
+        """Streaming moments: only a small frame chunk is converted to float64."""
+        count, mean, m2 = 0, 0.0, 0.0
+        with tqdm(training_fields, desc=progress_desc, unit="trajectory",
+                  disable=not show_progress, mininterval=.5, leave=False) as bar:
+            for array in bar:
+                x = _fields(array, check_finite=False)
+                for start in range(0, len(x), 64):
+                    chunk = np.asarray(x[start:start + 64], dtype=np.float64)
+                    if not np.isfinite(chunk).all():
+                        raise ValueError("Training fields must be finite.")
+                    chunk_count = chunk.size
+                    chunk_mean = float(chunk.mean())
+                    chunk_m2 = float(np.square(chunk - chunk_mean).sum())
+                    delta = chunk_mean - mean
+                    total = count + chunk_count
+                    m2 += chunk_m2 + delta * delta * count * chunk_count / total
+                    mean += delta * chunk_count / total
+                    count = total
+        if count == 0:
+            raise ValueError("Training split must not be empty.")
+        std = float(np.sqrt(m2 / count))
         if not np.isfinite(std) or std <= np.finfo(float).eps:
             raise ValueError("Training fields have no finite nonzero variance.")
         return cls(mean, std)
@@ -140,11 +164,14 @@ class AffineNormalizer:
 
 
 class _Pairs(Dataset):
+    """Keep mmap-backed trajectories on disk; copy only a requested pair."""
     def __init__(self, trajectories, lag_frames):
-        self.trajectories = [torch.as_tensor(_fields(x)[:, 0], dtype=torch.float64) for x in trajectories]
+        if not isinstance(lag_frames, int) or lag_frames < 1:
+            raise ValueError("lag_frames must be a positive integer.")
+        self.trajectories = [_fields(x, check_finite=False) for x in trajectories]
         self.lag = lag_frames
         lengths = [len(x) - lag_frames for x in self.trajectories]
-        if any(n <= 0 for n in lengths):
+        if not lengths or any(n <= 0 for n in lengths):
             raise ValueError("Each split trajectory must have more frames than lag_frames.")
         self.ends = np.cumsum(lengths)
 
@@ -152,10 +179,15 @@ class _Pairs(Dataset):
         return int(self.ends[-1])
 
     def __getitem__(self, index):
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
         trajectory = int(np.searchsorted(self.ends, index, side="right"))
         offset = index - (int(self.ends[trajectory - 1]) if trajectory else 0)
         x = self.trajectories[trajectory]
-        return torch.stack((x[offset], x[offset + self.lag]))
+        pair = np.stack((x[offset, 0], x[offset + self.lag, 0])).astype(np.float64, copy=False)
+        if not np.isfinite(pair).all():
+            raise ValueError("Observation pairs must be finite.")
+        return torch.from_numpy(pair)
 
 
 def source_provenance():
@@ -196,24 +228,34 @@ class FitResult:
 
 
 def train_shell_force(splits: TrainingSplits, output_dir, architecture=None, config=None,
-                      physical_metadata=None):
-    """Train and restore the best validation checkpoint; test data remain unused."""
+                      physical_metadata=None, *, show_progress=True, progress_desc=None):
+    """Joint training with iteration/validation ETA and bounded activation memory.
+
+    micro_batch_size accumulates one logical batch's mean gradient before a
+    single clipping/optimizer step. It does not change the requested batch size.
+    """
+    started = perf_counter()
     architecture = architecture or ArchitectureConfig()
     config = config or TrainingConfig()
+    label = progress_desc or "ShellForce train"
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     best_path = output_dir / "best_model_parameter.pth.tar"
     current_path = output_dir / "model_parameter.pth.tar"
     if best_path.exists() or current_path.exists():
         raise FileExistsError("Use a new output directory to preserve existing checkpoints.")
-    normalizer = AffineNormalizer.fit(splits.train)
+    for group in (splits.train, splits.validation, splits.test):
+        if not group:
+            raise ValueError("Train, validation and test splits must all be nonempty.")
+    normalizer = AffineNormalizer.fit(splits.train, show_progress=show_progress,
+                                       progress_desc=f"{label} normalization")
     train_data = _Pairs(splits.train, config.lag_frames)
     val_data = _Pairs(splits.validation, config.lag_frames)
     n = train_data.trajectories[0].shape[-1]
     if n <= 2 * architecture.max_distance:
         raise ValueError("Use N_side > 2*R so the NN shells do not alias periodic offsets.")
     for group in (splits.train, splits.validation, splits.test):
-        if any(_fields(x).shape[-2:] != (n, n) for x in group):
+        if any(_fields(x, check_finite=False).shape[-2:] != (n, n) for x in group):
             raise ValueError("All train/validation/test fields must have the same lattice.")
     torch.manual_seed(config.seed)
     rng = torch.Generator().manual_seed(config.seed)
@@ -222,64 +264,90 @@ def train_shell_force(splits: TrainingSplits, output_dir, architecture=None, con
     model = MultiScaleShellForceCNEEP2D(options).to(device=config.device, dtype=dtype)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     train_loader = DataLoader(train_data, batch_size=config.batch_size, shuffle=True, generator=rng)
-    val_loader = DataLoader(val_data, batch_size=config.batch_size, shuffle=False)
+    eval_batch_size = config.eval_batch_size or config.batch_size
+    val_loader = DataLoader(val_data, batch_size=eval_batch_size, shuffle=False)
+    micro_batch_size = config.micro_batch_size or config.batch_size
     manifest = {
         "architecture": vars(options), "training": asdict(config),
         "normalization": {**asdict(normalizer), "fit_split": "train_only", "rule": "z=(phi-m)/s; d_phi=d_z/s"},
         "split": splits.metadata, "provenance": source_provenance(),
         "physical_metadata": physical_metadata or {},
+        "dataset": {name: {"trajectories": len(arrays),
+                            "frames": sum(len(x) for x in arrays),
+                            "pairs": sum(len(x) - config.lag_frames for x in arrays)}
+                    for name, arrays in (("train", splits.train), ("validation", splits.validation), ("test", splits.test))},
         "n_sites": n * n, "optimizer": "AdamW",
         "loss": "mean[-expm1(alpha*S)/alpha + expm1(-(1+alpha)*S)/(1+alpha)], alpha=0 limit supported",
         "loss_score": "S=N*sum_r spatial_mean(d_z,r*delta_z); no extra scalar or beta factor",
+        "gradient_accumulation": "Mean gradient over each logical batch; clip and optimizer step once per batch",
         "input": "phi only; no gradients, phi^2, kernels, spatial coordinates or external increments",
         "status": "training_run_not_physical_validation",
     }
     (output_dir / "learning_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf8")
     history, best_val = [], float("inf")
     batches = iter(train_loader)
-    for iteration in range(1, config.iterations + 1):
-        try:
-            pair = next(batches)
-        except StopIteration:
-            batches = iter(train_loader)
-            pair = next(batches)
-        # Standardize in float64 before the optional conversion to float32.
-        x = normalizer.transform(pair).to(device=config.device, dtype=dtype)
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        loss = joint_neep_loss(model(x), n * n, config.alpha)
-        if not torch.isfinite(loss):
-            raise FloatingPointError("Nonfinite extensive NEEP loss; inspect learning rate, lag and initialization.")
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_norm, error_if_nonfinite=True)
-        optimizer.step()
-        if iteration == 1 or iteration % config.record_every == 0 or iteration == config.iterations:
-            model.eval()
-            val_sum, count = 0.0, 0
-            with torch.no_grad():
-                for pair in val_loader:
-                    x = normalizer.transform(pair).to(device=config.device, dtype=dtype)
-                    val_loss = joint_neep_loss(model(x), n * n, config.alpha)
-                    if not torch.isfinite(val_loss):
-                        raise FloatingPointError("Nonfinite validation objective.")
-                    val_sum += float(val_loss) * len(x)
-                    count += len(x)
-            val_mean = val_sum / count
-            history.append({"iteration": iteration, "train_loss": float(loss.detach()), "validation_loss": val_mean})
-            state = {
-                "settings": vars(options), "state_dict": model.state_dict(),
-                "optimizer": optimizer.state_dict(), "iteration": iteration,
-                "mean": torch.tensor(normalizer.mean, dtype=torch.float64),
-                "std": torch.tensor(normalizer.std, dtype=torch.float64),
-                "manifest": manifest, "history": history,
-            }
-            torch.save(state, current_path)
-            if val_mean < best_val:
-                best_val = val_mean
-                torch.save(state, best_path)
+    with tqdm(total=config.iterations, desc=label, unit="iteration", mininterval=.5,
+              disable=not show_progress) as train_bar:
+        for iteration in range(1, config.iterations + 1):
+            try:
+                pair = next(batches)
+            except StopIteration:
+                batches = iter(train_loader)
+                pair = next(batches)
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            loss_value = 0.0
+            for chunk in pair.split(micro_batch_size):
+                x = normalizer.transform(chunk).to(device=config.device, dtype=dtype)
+                loss = joint_neep_loss(model(x), n * n, config.alpha)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Nonfinite extensive NEEP loss; inspect learning rate, lag and initialization.")
+                weight = len(chunk) / len(pair)
+                (loss * weight).backward()
+                loss_value += float(loss.detach()) * weight
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_norm, error_if_nonfinite=True)
+            optimizer.step()
+            if iteration == 1 or iteration % config.record_every == 0 or iteration == config.iterations:
+                model.eval()
+                val_sum, count = 0.0, 0
+                validation_started = perf_counter()
+                with torch.no_grad(), tqdm(total=len(val_data), desc=f"{label} validation {iteration}",
+                        unit="pair", mininterval=.5, leave=False, disable=not show_progress) as val_bar:
+                    for pair in val_loader:
+                        for chunk in pair.split(micro_batch_size):
+                            x = normalizer.transform(chunk).to(device=config.device, dtype=dtype)
+                            val_loss = joint_neep_loss(model(x), n * n, config.alpha)
+                            if not torch.isfinite(val_loss):
+                                raise FloatingPointError("Nonfinite validation objective.")
+                            val_sum += float(val_loss) * len(x)
+                            count += len(x)
+                            val_bar.update(len(x))
+                val_mean = val_sum / count
+                history.append({"iteration": iteration, "train_loss": loss_value,
+                                "validation_loss": val_mean, "elapsed_seconds": perf_counter() - started,
+                                "validation_seconds": perf_counter() - validation_started})
+                manifest["elapsed_seconds"] = perf_counter() - started
+                state = {
+                    "settings": vars(options), "state_dict": model.state_dict(),
+                    "optimizer": optimizer.state_dict(), "iteration": iteration,
+                    "mean": torch.tensor(normalizer.mean, dtype=torch.float64),
+                    "std": torch.tensor(normalizer.std, dtype=torch.float64),
+                    "manifest": manifest, "history": history,
+                }
+                torch.save(state, current_path)
+                if val_mean < best_val:
+                    best_val = val_mean
+                    torch.save(state, best_path)
+                train_bar.set_postfix(loss=f"{loss_value:.5g}", val=f"{val_mean:.5g}", refresh=False)
+            train_bar.update(1)
+    manifest["elapsed_seconds"] = perf_counter() - started
     state = torch.load(best_path, map_location=config.device, weights_only=True)
     model.load_state_dict(state["state_dict"])
     model.eval()
+    state["manifest"] = manifest
+    state["history"] = history
+    torch.save(state, best_path)
+    (output_dir / "learning_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf8")
     (output_dir / "training_history.json").write_text(json.dumps(history, indent=2), encoding="utf8")
     return FitResult(model, normalizer, history, manifest, best_path)
 
@@ -309,13 +377,17 @@ def _summary(segments, block_pairs):
 
 
 def evaluate_shell_force(fit: FitResult, trajectories, physical_model, frame_dt,
-                         lag_frames=1, batch_size=32, block_pairs=32, output_dir=None):
+                         lag_frames=1, batch_size=32, block_pairs=32, output_dir=None, *,
+                         show_progress=True, progress_desc=None, micro_batch_size=32):
     """Report neural EP, endpoint work, and known-channel projection separately.
 
     The endpoint work uses observation pairs, not integration-step streaming
     truth. Projection uses the left endpoint as an equal-time state and is a
     rate already: it must NOT be divided by lag again. No pair crosses a seed.
     """
+    started = perf_counter()
+    if micro_batch_size is not None and (not isinstance(micro_batch_size, int) or micro_batch_size < 1):
+        raise ValueError("micro_batch_size must be a positive integer or None.")
     if min(lag_frames, batch_size, block_pairs) < 1 or frame_dt <= 0:
         raise ValueError("Lag/batch/block and frame interval must be positive.")
     if isinstance(trajectories, np.ndarray):
@@ -324,51 +396,65 @@ def evaluate_shell_force(fit: FitResult, trajectories, physical_model, frame_dt,
     parameter = next(model.parameters())
     device, dtype = parameter.device, parameter.dtype
     radius = model.max_distance
-    all_values = {}
+    trajectories = list(trajectories)
+    if not trajectories:
+        raise ValueError("Evaluation needs at least one trajectory.")
+    total_pairs = 0
     for trajectory in trajectories:
-        x = _fields(trajectory)[:, 0]
+        x = _fields(trajectory, check_finite=False)
         if x.shape[-2:] != physical_model.shape or len(x) <= lag_frames:
             raise ValueError("Physical model shape or observation lag does not match fields.")
-        local = {}
-        # Nonoverlapping observation intervals reduce gratuitous pair overlap.
-        starts = np.arange(0, len(x) - lag_frames, lag_frames)
-        for begin in range(0, len(starts), batch_size):
-            ii = starts[begin:begin + batch_size]
-            pair_np = np.stack((x[ii], x[ii + lag_frames]), axis=1)
-            pair = torch.as_tensor(pair_np, dtype=torch.float64)
-            with torch.no_grad():
-                z = normalizer.transform(pair).to(device=device, dtype=dtype)
-                raw_rates = model(z).cpu().numpy() * physical_model.N / (frame_dt * lag_frames)
-                stationary_pair = torch.stack((pair[:, 0], pair[:, 0]), dim=1)
-                z_equal = normalizer.transform(stationary_pair).to(device=device, dtype=dtype)
-                forces = model(z_equal, return_forces=True)
-                force_phi = normalizer.force_to_phi(forces.sum(dim=1)[:, 0]).cpu().numpy()
-            for r in range(raw_rates.shape[1]):
-                local.setdefault(("NN_raw_branch", "learned", f"r{r}"), []).extend(raw_rates[:, r])
-            local.setdefault(("NN_total", "total", "all"), []).extend(raw_rates.sum(axis=1))
-            for j, i in enumerate(ii):
-                midpoint = (x[i] + x[i + lag_frames]) / 2
-                delta = x[i + lag_frames] - x[i]
-                mid_channels = physical_model.active_channels(midpoint, max_distance=radius)
-                eq_channels = physical_model.active_channels(x[i], max_distance=radius)
-                lap_force = laplacian(force_phi[j])
-                totals = {"endpoint_midpoint": 0.0, "NN_force_projection": 0.0}
-                for label, nu in mid_channels.items():
-                    mechanism, shell = label.split(":", 1)
-                    work = -float(np.sum(nu * delta)) / (physical_model.config.D * frame_dt * lag_frames)
-                    projection = -float(np.sum(eq_channels[label] * lap_force))
-                    local.setdefault(("endpoint_midpoint", mechanism, shell), []).append(work)
-                    local.setdefault(("NN_force_projection", mechanism, shell), []).append(projection)
-                    totals["endpoint_midpoint"] += work
-                    totals["NN_force_projection"] += projection
-                for method, value in totals.items():
-                    local.setdefault((method, "total", "all"), []).append(value)
-        for key, values in local.items():
-            all_values.setdefault(key, []).append(np.asarray(values, dtype=float))
+        total_pairs += len(range(0, len(x) - lag_frames, lag_frames))
+    step_size = min(batch_size, micro_batch_size or batch_size)
+    all_values = {}
+    with tqdm(total=total_pairs, desc=progress_desc or "ShellForce evaluation", unit="pair",
+              mininterval=.5, disable=not show_progress) as evaluation_bar:
+        for trajectory in trajectories:
+            x = _fields(trajectory)[:, 0]
+            if x.shape[-2:] != physical_model.shape or len(x) <= lag_frames:
+                raise ValueError("Physical model shape or observation lag does not match fields.")
+            local = {}
+            # Nonoverlapping observation intervals reduce gratuitous pair overlap.
+            starts = np.arange(0, len(x) - lag_frames, lag_frames)
+            for begin in range(0, len(starts), step_size):
+                ii = starts[begin:begin + step_size]
+                pair_np = np.stack((x[ii], x[ii + lag_frames]), axis=1)
+                pair = torch.as_tensor(pair_np, dtype=torch.float64)
+                with torch.no_grad():
+                    z = normalizer.transform(pair).to(device=device, dtype=dtype)
+                    raw_rates = model(z).cpu().numpy() * physical_model.N / (frame_dt * lag_frames)
+                    stationary_pair = torch.stack((pair[:, 0], pair[:, 0]), dim=1)
+                    z_equal = normalizer.transform(stationary_pair).to(device=device, dtype=dtype)
+                    forces = model(z_equal, return_forces=True)
+                    force_phi = normalizer.force_to_phi(forces.sum(dim=1)[:, 0]).cpu().numpy()
+                for r in range(raw_rates.shape[1]):
+                    local.setdefault(("NN_raw_branch", "learned", f"r{r}"), []).extend(raw_rates[:, r])
+                local.setdefault(("NN_total", "total", "all"), []).extend(raw_rates.sum(axis=1))
+                for j, i in enumerate(ii):
+                    midpoint = (x[i] + x[i + lag_frames]) / 2
+                    delta = x[i + lag_frames] - x[i]
+                    mid_channels = physical_model.active_channels(midpoint, max_distance=radius)
+                    eq_channels = physical_model.active_channels(x[i], max_distance=radius)
+                    lap_force = laplacian(force_phi[j])
+                    totals = {"endpoint_midpoint": 0.0, "NN_force_projection": 0.0}
+                    for label, nu in mid_channels.items():
+                        mechanism, shell = label.split(":", 1)
+                        work = -float(np.sum(nu * delta)) / (physical_model.config.D * frame_dt * lag_frames)
+                        projection = -float(np.sum(eq_channels[label] * lap_force))
+                        local.setdefault(("endpoint_midpoint", mechanism, shell), []).append(work)
+                        local.setdefault(("NN_force_projection", mechanism, shell), []).append(projection)
+                        totals["endpoint_midpoint"] += work
+                        totals["NN_force_projection"] += projection
+                    for method, value in totals.items():
+                        local.setdefault((method, "total", "all"), []).append(value)
+                evaluation_bar.update(len(ii))
+            for key, values in local.items():
+                all_values.setdefault(key, []).append(np.asarray(values, dtype=float))
     rows = [{"method": key[0], "mechanism": key[1], "shell": key[2],
              **_summary(segments, block_pairs)} for key, segments in all_values.items()]
     result = {"rows": rows, "values_by_trajectory": all_values,
               "observation_interval": frame_dt * lag_frames,
+              "elapsed_seconds": perf_counter() - started,
               "note": "Endpoint work is finite-lag; compare separately with streaming integration-step truth. Signed branches are retained."}
     if output_dir is not None:
         destination = Path(output_dir)
@@ -384,7 +470,8 @@ def evaluate_shell_force(fit: FitResult, trajectories, physical_model, frame_dt,
     return result
 
 
-def projected_curl_check(fit: FitResult, physical_model, phi, probes=8, seed=73031):
+def projected_curl_check(fit: FitResult, physical_model, phi, probes=8, seed=73031, *,
+                         show_progress=True, progress_desc=None):
     """Random zero-mean bilinear check of J_d-J_d.T + (J_mu-J_mu.T)/D.
 
     A small sampled residual is a diagnostic, not a proof of global exactness.
@@ -403,26 +490,29 @@ def projected_curl_check(fit: FitResult, physical_model, phi, probes=8, seed=730
         return fit.normalizer.force_to_phi(dz)
     rng = np.random.default_rng(seed)
     residuals, targets, learned = [], [], []
-    for _ in range(probes):
-        u, v = rng.normal(size=phi.shape), rng.normal(size=phi.shape)
-        u -= u.mean()
-        v -= v.mean()
-        u /= np.linalg.norm(u)
-        v /= np.linalg.norm(v)
-        ut = torch.as_tensor(u, device=x.device, dtype=x.dtype)
-        vt = torch.as_tensor(v, device=x.device, dtype=x.dtype)
-        _, jdu = torch.autograd.functional.jvp(force, x, ut)
-        _, jdv = torch.autograd.functional.jvp(force, x, vt)
-        curl_d = float((ut * jdv - vt * jdu).sum().detach())
-        curl_mu = float(np.sum(u * physical_model.mu_jvp(phi, v) - v * physical_model.mu_jvp(phi, u)))
-        target = -curl_mu / physical_model.config.D
-        targets.append(target)
-        learned.append(curl_d)
-        residuals.append(curl_d - target)
+    started = perf_counter()
+    with tqdm(range(probes), desc=progress_desc or "Projected curl", unit="probe",
+              mininterval=.5, leave=False, disable=not show_progress) as bar:
+        for _ in bar:
+            u, v = rng.normal(size=phi.shape), rng.normal(size=phi.shape)
+            u -= u.mean()
+            v -= v.mean()
+            u /= np.linalg.norm(u)
+            v /= np.linalg.norm(v)
+            ut = torch.as_tensor(u, device=x.device, dtype=x.dtype)
+            vt = torch.as_tensor(v, device=x.device, dtype=x.dtype)
+            _, jdu = torch.autograd.functional.jvp(force, x, ut)
+            _, jdv = torch.autograd.functional.jvp(force, x, vt)
+            curl_d = float((ut * jdv - vt * jdu).sum().detach())
+            curl_mu = float(np.sum(u * physical_model.mu_jvp(phi, v) - v * physical_model.mu_jvp(phi, u)))
+            target = -curl_mu / physical_model.config.D
+            targets.append(target)
+            learned.append(curl_d)
+            residuals.append(curl_d - target)
     rms = float(np.sqrt(np.mean(np.square(residuals))))
     target_rms = float(np.sqrt(np.mean(np.square(targets))))
     return {"residual_rms": rms, "target_rms": target_rms,
             "relative_residual": rms / target_rms if target_rms > 1e-14 else None,
             "learned_bilinear": learned, "target_bilinear": targets,
-            "n_probes": probes, "seed": seed,
+            "n_probes": probes, "seed": seed, "elapsed_seconds": perf_counter() - started,
             "note": "Projected total curl only; raw branch attribution additionally needs branch residual and mean-work tests."}

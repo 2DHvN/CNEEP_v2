@@ -12,9 +12,11 @@ import json
 import platform
 from importlib import metadata
 from pathlib import Path
+from time import perf_counter
 from typing import Callable
 
 import numpy as np
+from tqdm.auto import tqdm
 
 from .diagnostics import integrated_autocorrelation, json_safe, stationarity_report, summarize_blocks, write_json
 from .model import AMBKernelModel, ModelConfig, laplacian
@@ -168,14 +170,23 @@ def _source_hashes() -> dict:
 
 def run_experiment(model_or_config, run_config: RunConfig | None = None,
                    output_dir=None, *, initial_field=None, nn_metadata: dict | None = None,
-                   progress: Callable[[int, int], None] | None = None) -> ExperimentResult:
+                   progress: Callable[[int, int], None] | None = None,
+                   show_progress: bool = True, progress_desc: str | None = None,
+                   progress_details: Callable[[dict], None] | None = None) -> ExperimentResult:
     """Run burn-in and measurement, saving exact lags and per-step active work.
 
     The equal-time estimator is evaluated at phi_now, independently of the
     midpoint work. Failure artifacts preserve only completed steps, with an
     explicit incomplete status, and SimulationFailure carries the partial run.
     A failed run must be restarted from the beginning with a smaller dt.
+
+    The progress bar includes burn-in and measurement and displays elapsed time
+    and ETA. ``progress(done, total)`` retains its original two-argument API.
+    ``progress_details(info)`` additionally receives phase, elapsed_seconds and
+    eta_seconds after each completed integration step. Set show_progress=False
+    when a caller provides an aggregate bar for multiple trajectories.
     """
+    started_at = perf_counter()
     model = model_or_config if isinstance(model_or_config, AMBKernelModel) else AMBKernelModel(model_or_config)
     cfg = run_config or RunConfig()
     if not isinstance(cfg, RunConfig):
@@ -360,14 +371,26 @@ def run_experiment(model_or_config, run_config: RunConfig | None = None,
                          "short smoke runs do not establish stationary EPR"], "run_status": status}
         result = ExperimentResult(stored, np.asarray(times), summary, json_safe(diagnostics), json_safe(manifest),
                                   arrays, counts, obs, model)
+        result.diagnostics["elapsed_seconds"] = result.manifest["elapsed_seconds"] = perf_counter() - started_at
         if output_dir is not None:
             result.save(output_dir)
+            # Include artifact writes in the duration retained in both memory
+            # and the saved metadata (the final timing refresh is excluded).
+            result.diagnostics["elapsed_seconds"] = result.manifest["elapsed_seconds"] = perf_counter() - started_at
+            write_json(Path(output_dir) / "diagnostics.json", result.diagnostics)
+            write_json(Path(output_dir) / "manifest.json", result.manifest)
         return result
 
+    total_steps = cfg.burn_in_steps + cfg.measurement_steps
+    bar = tqdm(total=total_steps, desc=progress_desc or f"{model.config.model_id} seed={cfg.seed}",
+               unit="step", mininterval=0.25, dynamic_ncols=True, disable=not show_progress,
+               bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                          "[{elapsed} elapsed, ETA {remaining}, {rate_fmt}{postfix}]")
+    bar.set_postfix_str("phase=burn-in" if cfg.burn_in_steps else "phase=measurement", refresh=False)
     try:
-        total_steps = cfg.burn_in_steps + cfg.measurement_steps
         for step in range(total_steps):
             if step == cfg.burn_in_steps:
+                bar.set_postfix_str("phase=measurement", refresh=False)
                 phi_measure_start = phi.copy()
                 passive_start = model.passive_channels(phi)
                 record_frame(step * cfg.dt)
@@ -420,13 +443,23 @@ def run_experiment(model_or_config, run_config: RunConfig | None = None,
                     record_frame((step + 1) * cfg.dt)
                 if in_block == cfg.block_steps:
                     close_block()
+            bar.update(1)
             if progress is not None:
                 progress(step + 1, total_steps)
+            if progress_details is not None:
+                elapsed = perf_counter() - started_at
+                progress_details({"completed_steps": step + 1, "total_steps": total_steps,
+                                  "phase": "burn-in" if step < cfg.burn_in_steps else "measurement",
+                                  "elapsed_seconds": elapsed,
+                                  "eta_seconds": elapsed * (total_steps - step - 1) / (step + 1)})
     except Exception as exc:
+        bar.set_postfix_str("phase=failed", refresh=False)
         result = finalize("incomplete", f"{type(exc).__name__}: {exc}")
         raise SimulationFailure(f"Simulation failed after {burn_completed} burn-in and {completed} measurement steps. "
                                 "Inspect the preserved partial result and restart with a smaller dt. "
                                 f"Cause: {exc}", result) from exc
+    finally:
+        bar.close()
     return finalize("complete")
 
 
