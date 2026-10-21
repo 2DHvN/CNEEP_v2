@@ -1,5 +1,8 @@
 # CNEEP_v2
 
+- [Nonlocal AMB ?? ?? M00?M05 ???](data/amb_kernel/README.md)
+- [Nonlocal AMB ???EPR?ShellForce ?? notebook](notebooks/Corr_AMB_Kernel_ShellForce.ipynb)
+
 - [LABP-M exact Gillespie ensemble 모델](data/labp_m/README.md)
 - [LABP-M ensemble 학습 notebook](notebooks/Corr_labpm.ipynb)
 - [LABP-M MIPS sanity check](data/labp_m/sanity_check_labpm.ipynb)
