@@ -260,7 +260,9 @@ def run_experiments_batched(model, run_configs, output_dirs, *, device="cuda",
     reference, cfg = gpu.reference, configs[0]
     batch = len(configs)
     rngs = [np.random.default_rng(config.seed) for config in configs]
-    initial = np.stack([reference.initial_field(rng, scale=config.initial_scale)
+    initial = np.stack([reference.initial_field(rng, scale=config.initial_scale, mode=config.initial_mode,
+                        circle_radius_fraction=config.circle_radius_fraction,
+                        circle_width=config.circle_width, circle_amplitude=config.circle_amplitude)
                         for rng, config in zip(rngs, configs)])
     phi = torch.as_tensor(initial, dtype=torch.float64, device=gpu.device)
     zero = torch.zeros(batch, dtype=torch.float64, device=gpu.device)

@@ -168,7 +168,8 @@ def _simulator_hashes(*, torch_backend: bool = False) -> dict[str, str]:
 
 def _run_template(config: DatasetConfig, template: RunConfig | None) -> RunConfig:
     if template is None:
-        template = RunConfig(dt=0.01, observation_lags=tuple(config.observation_stride*k for k in (1, 4, 16)),
+        template = RunConfig(dt=0.01, initial_mode="circle", initial_scale=0.0,
+                             observation_lags=tuple(config.observation_stride*k for k in (1, 4, 16)),
                              block_steps=min(1024, config.intervals*config.observation_stride))
     if not isinstance(template, RunConfig):
         raise TypeError("run_config must be a RunConfig or None.")

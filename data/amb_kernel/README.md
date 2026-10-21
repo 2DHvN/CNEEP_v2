@@ -19,7 +19,11 @@
 | Validation | 256 | 1,000 / 1,001 | 256,000 |
 | Test | 10 | 1,000 / 1,001 | 10,000 |
 
-기본 grid는 32×32, TRAIN_DT=0.01, burn-in은 10,000 step입니다. Trajectory 수는 기존 LABPM 규모를 따릅니다. 학습은 2,000 optimizer iterations, train/eval logical batch 2,048, gradient 누적 micro batch 32이며 H64/layers3/R3/ELU architecture를 모든 모델에 고정합니다.
+학습 grid는 **32×32**, TRAIN_DT=0.01, burn-in은 10,000 step입니다. Trajectory 수는 기존 LABPM 규모를 따릅니다. 학습은 2,000 optimizer iterations, train/eval logical batch 2,048, gradient 누적 micro batch 32이며 H64/layers3/R3/ELU architecture를 모든 모델에 고정합니다.
+
+초기조건은 두 notebook 모두 circle profile입니다. 설정 cell의 INITIAL_MODE='circle', INITIAL_NOISE_SCALE=0.0, CIRCLE_RADIUS_FRACTION=0.25, CIRCLE_WIDTH=1.0, CIRCLE_AMPLITUDE=1.0에서 조절합니다. Periodic distance를 이용한 tanh 경계의 원을 만든 뒤 초기 field의 평균을 한 번 phi_bar에 맞춥니다. 기본 반경은 학습 32×32에서 8, sanity 64×64에서 16 lattice units입니다. 초기 noise 설정은 초기 profile의 perturbation이며 dynamics의 D를 바꾸지 않습니다.
+
+설정 다음 cell은 실제 초기조건 생성 함수로 만든 **t=0, burn-in 이전** field를 보여 줍니다. Circle은 초기조건이며 선택한 a/b와 noise 등에 따라 burn-in 동안 완화될 수 있습니다. 물리 계수를 바꾸어 모양을 고정하지 않습니다. Profile video는 burn-in 이후의 실제 held-out test frames를 그대로 사용합니다. 초기조건 설정은 RunConfig와 run/dataset manifest에 기록됩니다.
 
 Float64 field 파일은 모델당 약 **9.85 GiB**, 여섯 모델 약 59.1 GiB이며 진단과 checkpoint 공간이 추가됩니다. Trajectory별 저장과 read-only memory map을 사용하고, 모델별 학습·평가를 마치면 map을 닫습니다. 기존 dataset은 물리 설정·kernel·seed·backend·source가 일치하는 완료 자료만 재사용합니다.
 
@@ -35,7 +39,7 @@ Float64 field 파일은 모델당 약 **9.85 GiB**, 여섯 모델 약 59.1 GiB�
 
 ## Parameter / system sanity notebook
 
-기본값은 **M01 / primary / seed 73031 한 run**, N=32, DT=0.01, burn-in 10,000, measurement 1,000 step입니다. SELECTED_MODELS, CASE_NAMES, MODEL_OVERRIDES, SEEDS에서 필요한 비교만 명시적으로 선택합니다. 선택하지 않은 모델이나 control을 추가 실행하지 않습니다.
+기본값은 **M01 / primary / seed 73031 한 run**, **N=64**, DT=0.01, burn-in 10,000, measurement 1,000 step과 circle 초기 profile입니다. SELECTED_MODELS, CASE_NAMES, MODEL_OVERRIDES, SEEDS에서 필요한 비교만 명시적으로 선택합니다. 선택하지 않은 모델이나 control을 추가 실행하지 않습니다.
 
 DT_FACTORS=(1.0, 0.5, 0.25)로 dt 비교를 선택하면 burn-in/measurement/block 시간과 observation interval을 물리 시간 기준으로 맞춥니다. Integer step으로 표현할 수 없는 조합은 오류로 알립니다. Kernel의 full/odd component와 축 profile, field profile, 평균 phi², gradient energy, low-q structure factor, mass drift, solver residual을 확인합니다.
 
@@ -83,8 +87,5 @@ CNEEP_v2에서 실행합니다.
     python scripts/make_amb_kernel_notebook.py
     python scripts/make_amb_kernel_sanity_notebook.py
     python -m unittest discover -s tests -p 'test_amb_kernel*.py' -v
-    python tests/check_amb_kernel_notebooks.py --output-dir output/notebook_check
-
-마지막 개발 검증 명령은 새 output directory를 사용합니다. 실행 비용을 줄이는 설정은 검증 코드가 메모리 안에서만 바꾸며 공개 notebook 기본값을 별도의 짧은 preset으로 바꾸지 않습니다.
 
 실제 물리 판정에는 independent seeds, 안정적인 correlation-time 추정, 충분한 burn-in과 blocks, reciprocal/null controls, dt/lag 수렴이 필요합니다. sigma > 3*block_SE 한 조건이나 학습 loss 감소만으로 stationarity, 양의 EPR 또는 kernel attribution을 검증했다고 결론내리지 않습니다.

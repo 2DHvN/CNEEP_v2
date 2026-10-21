@@ -43,6 +43,10 @@ class RunConfig:
     solver_maxiter: int = 20
     initial_scale: float = 0.05
     storage_dtype: str = "float64"
+    initial_mode: str = "random"
+    circle_radius_fraction: float = 0.25
+    circle_width: float = 1.0
+    circle_amplitude: float = 1.0
 
     def __post_init__(self):
         for name in ("seed", "burn_in_steps", "measurement_steps", "observation_stride",
@@ -65,6 +69,13 @@ class RunConfig:
             raise ValueError("solver_atol must be strictly positive")
         if self.storage_dtype not in ("float32", "float64"):
             raise ValueError("storage_dtype must be float32 or float64")
+        if self.initial_mode not in ("random", "circle"):
+            raise ValueError("initial_mode must be 'random' or 'circle'.")
+        if not np.isfinite(self.circle_radius_fraction) or not 0 < self.circle_radius_fraction <= 0.5:
+            raise ValueError("circle_radius_fraction must be finite and in (0, 0.5].")
+        for name in ("circle_width", "circle_amplitude"):
+            if not np.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive and finite.")
         for name in ("solver_atol", "solver_rtol", "initial_scale"):
             if not np.isfinite(getattr(self, name)) or getattr(self, name) < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
@@ -196,7 +207,10 @@ def run_experiment(model_or_config, run_config: RunConfig | None = None,
         if any((target / name).exists() for name in ("manifest.json", "fields.npy", "ep_blocks.csv")):
             raise FileExistsError(f"Run already exists in {target}; select a new output directory")
     rng = np.random.default_rng(cfg.seed)
-    phi = (model.initial_field(rng, scale=cfg.initial_scale) if initial_field is None
+    phi = (model.initial_field(rng, scale=cfg.initial_scale, mode=cfg.initial_mode,
+                               circle_radius_fraction=cfg.circle_radius_fraction,
+                               circle_width=cfg.circle_width, circle_amplitude=cfg.circle_amplitude)
+           if initial_field is None
            else np.array(initial_field, dtype=np.float64, copy=True))
     if phi.shape != model.shape or not np.isfinite(phi).all():
         raise ValueError(f"initial_field must be a finite array of shape {model.shape}")

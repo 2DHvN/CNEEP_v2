@@ -414,10 +414,40 @@ class AMBKernelModel:
                       + bonds[1]-np.roll(bonds[1], 1, axis=-2))
         return np.sqrt(2*self.config.D*dt)*divergence
 
-    def initial_field(self, rng: np.random.Generator, scale: float = 0.05) -> np.ndarray:
+    def initial_field(self, rng: np.random.Generator, scale: float = 0.05, *,
+                      mode: str = "random", circle_radius_fraction: float = 0.25,
+                      circle_width: float = 1.0, circle_amplitude: float = 1.0) -> np.ndarray:
+        """Initialize a fixed-mean random field or a smooth periodic circle.
+
+        The circle is centered at (n/2,n/2), with radius fraction*n and a tanh
+        interface of width circle_width lattice sites. circle_amplitude is the
+        tanh half-contrast before the one-time mean adjustment; it does not
+        depend on the model's a or b. scale optionally adds Gaussian perturbations.
+        A scale=0 circle consumes no RNG draws. The historical random mode keeps
+        its exact draw sequence, including its scale=0 behavior. Initializing a
+        circle changes no model coefficients and does not imply a stable droplet.
+        """
         if not np.isfinite(scale) or scale < 0:
             raise ValueError("scale must be finite and nonnegative.")
-        p = scale*rng.standard_normal(self.shape)
+        if mode not in {"random", "circle"}:
+            raise ValueError("mode must be 'random' or 'circle'.")
+        if mode == "random":
+            p = scale*rng.standard_normal(self.shape)
+        else:
+            parameters = (circle_radius_fraction, circle_width, circle_amplitude)
+            if not np.all(np.isfinite(parameters)):
+                raise ValueError("Circle parameters must be finite.")
+            if not 0 < circle_radius_fraction <= 0.5:
+                raise ValueError("circle_radius_fraction must lie in (0, 0.5].")
+            if circle_width <= 0 or circle_amplitude <= 0:
+                raise ValueError("circle_width and circle_amplitude must be positive.")
+            n = self.config.n
+            center = n/2
+            offsets = (np.arange(n, dtype=np.float64)-center+n/2) % n-n/2
+            distance = np.hypot(offsets[:, None], offsets[None, :])
+            p = circle_amplitude*np.tanh((circle_radius_fraction*n-distance)/circle_width)
+            if scale:
+                p = p+scale*rng.standard_normal(self.shape)
         return p-p.mean()+self.config.phi_bar
 
     def gaussian_reference(self, max_distance: int | None = None) -> dict[str, Any]:
