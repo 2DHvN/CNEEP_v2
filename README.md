@@ -1,7 +1,8 @@
 # CNEEP_v2
 
-- [Nonlocal AMB ?? ?? M00?M05 ???](data/amb_kernel/README.md)
-- [Nonlocal AMB ???EPR?ShellForce ?? notebook](notebooks/Corr_AMB_Kernel_ShellForce.ipynb)
+- [Nonlocal AMB M00–M05 모델 및 실행 안내](data/amb_kernel/README.md)
+- [AMB Kernel ShellForce 학습·시각화 notebook](notebooks/Corr_AMB_Kernel_ShellForce.ipynb)
+- [AMB Kernel 파라미터·시스템 sanity check](notebooks/Sanity_AMB_Kernel.ipynb)
 
 - [LABP-M exact Gillespie ensemble 모델](data/labp_m/README.md)
 - [LABP-M ensemble 학습 notebook](notebooks/Corr_labpm.ipynb)
