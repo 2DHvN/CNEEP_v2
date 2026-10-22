@@ -19,13 +19,13 @@
 | Validation | 256 | 1,000 / 1,001 | 256,000 |
 | Test | 10 | 1,000 / 1,001 | 10,000 |
 
-학습 grid는 **32×32**, TRAIN_DT=0.01, burn-in은 10,000 step입니다. Trajectory 수는 기존 LABPM 규모를 따릅니다. 학습은 2,000 optimizer iterations, train/eval logical batch 2,048, gradient 누적 micro batch 32이며 H64/layers3/R3/ELU architecture를 모든 모델에 고정합니다.
+현재 학습 notebook은 **M01 primary 하나만** 실행합니다. Sanity에서 선택한 a=-1, b=1, kappa=2, g1=g2=0.1, D=0.01, phi_bar=-0.57, ell=1.2를 사용합니다. 학습 grid는 **32×32**, TRAIN_DT=0.01, burn-in은 **3,000 step**, 측정은 1,000 step입니다. Trajectory 수는 기존 LABPM 규모를 따릅니다. 학습은 2,000 optimizer iterations, train/eval logical batch 2,048, gradient 누적 micro batch 32이며 H64/layers3/R3/ELU architecture를 사용합니다.
 
-초기조건은 두 notebook 모두 circle profile입니다. 설정 cell의 INITIAL_MODE='circle', INITIAL_NOISE_SCALE=0.0, CIRCLE_RADIUS_FRACTION=0.25, CIRCLE_WIDTH=1.0, CIRCLE_AMPLITUDE=1.0에서 조절합니다. Periodic distance를 이용한 tanh 경계의 원을 만든 뒤 초기 field의 평균을 한 번 phi_bar에 맞춥니다. 기본 반경은 학습 32×32에서 8, sanity 64×64에서 16 lattice units입니다. 초기 noise 설정은 초기 profile의 perturbation이며 dynamics의 D를 바꾸지 않습니다.
+초기조건은 circle profile입니다. 학습 설정은 INITIAL_MODE='circle', INITIAL_NOISE_SCALE=0.0, CIRCLE_RADIUS_FRACTION=0.25, CIRCLE_WIDTH=2.1, CIRCLE_AMPLITUDE=0.95로 Sanity의 선택값을 반영합니다. Periodic distance를 이용한 tanh 경계의 원을 만든 뒤 초기 field의 평균을 한 번 phi_bar에 맞춥니다. 기본 반경은 학습 32×32에서 8, sanity 64×64에서 16 lattice units입니다. 초기 noise 설정은 초기 profile의 perturbation이며 dynamics의 D를 바꾸지 않습니다.
 
 설정 다음 cell은 실제 초기조건 생성 함수로 만든 **t=0, burn-in 이전** field를 보여 줍니다. Circle은 초기조건이며 선택한 a/b와 noise 등에 따라 burn-in 동안 완화될 수 있습니다. 물리 계수를 바꾸어 모양을 고정하지 않습니다. Profile video는 burn-in 이후의 실제 held-out test frames를 그대로 사용합니다. 초기조건 설정은 RunConfig와 run/dataset manifest에 기록됩니다.
 
-Float64 field 파일은 모델당 약 **9.85 GiB**, 여섯 모델 약 59.1 GiB이며 진단과 checkpoint 공간이 추가됩니다. Trajectory별 저장과 read-only memory map을 사용하고, 모델별 학습·평가를 마치면 map을 닫습니다. 기존 dataset은 물리 설정·kernel·seed·backend·source가 일치하는 완료 자료만 재사용합니다.
+Float64 field 파일은 현재 M01 한 모델에 약 **9.85 GiB**이며 진단과 checkpoint 공간이 추가됩니다. Trajectory별 저장과 read-only memory map을 사용하고, 모델별 학습·평가를 마치면 map을 닫습니다. 기존 dataset은 물리 설정·kernel·seed·backend·source가 일치하는 완료 자료만 재사용합니다.
 
 학습 결과에서 다음을 확인합니다.
 
