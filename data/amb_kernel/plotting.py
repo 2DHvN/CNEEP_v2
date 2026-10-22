@@ -50,6 +50,56 @@ def _movie(fig, update, count, path, *, fps, description, show_progress):
             plt.close(fig)
 
 
+def render_profile_video(fields, times, output_path, *, title="", fps=10,
+                         frame_stride=5, max_frames=200, show_progress=True) -> dict:
+    """Render a bounded selection of saved [T,1,Ny,Nx] fields, including endpoints.
+
+    Only selected frames are copied from a memory map. Physical timestamps are
+    taken from the run, not inferred from playback fps or from frame indices.
+    This does not invent or simulate the unrecorded burn-in trajectory.
+    """
+    if len(fields.shape) != 4 or fields.shape[1] != 1 or fields.shape[0] < 1:
+        raise ValueError('fields must have nonempty shape [T,1,Ny,Nx].')
+    for name, value, minimum in (('frame_stride', frame_stride, 1), ('max_frames', max_frames, 2)):
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < minimum:
+            raise ValueError(f'{name} must be an integer >= {minimum}.')
+    if not np.isfinite(fps) or fps <= 0:
+        raise ValueError('fps must be positive and finite.')
+    times = np.asarray(times, dtype=np.float64)
+    if (times.shape != (len(fields),) or not np.isfinite(times).all()
+            or np.any(np.diff(times) <= 0)):
+        raise ValueError('times must be finite, strictly increasing and match the saved frames.')
+    indices = np.unique(np.r_[np.arange(0, len(fields), frame_stride), len(fields) - 1])
+    if len(indices) > max_frames:
+        indices = indices[np.linspace(0, len(indices) - 1, max_frames, dtype=int)]
+    phi = np.array(fields[indices, 0], dtype=np.float64, copy=True)
+    if not np.isfinite(phi).all():
+        raise ValueError('Selected video frames must be finite.')
+    selected_times = times[indices]
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, axis = plt.subplots(figsize=(5.5, 5), dpi=100)
+    image = axis.imshow(phi[0], origin='lower', interpolation='nearest', cmap='RdBu_r',
+                        norm=_symmetric_norm(phi))
+    axis.set(xlabel='x (lattice site)', ylabel='y (lattice site)')
+    fig.colorbar(image, ax=axis, shrink=.82, label=r'physical $\phi$')
+    heading = axis.set_title('')
+    fig.tight_layout()
+
+    def update(index):
+        image.set_data(phi[index])
+        heading.set_text(f'{title}\nt={selected_times[index]:.6g} | saved frame {indices[index]}')
+        return image, heading
+
+    _movie(fig, update, len(indices), path, fps=fps,
+           description='Sanity profile video export', show_progress=show_progress)
+    metadata = {'frame_indices': indices.tolist(), 'physical_times': selected_times.tolist(),
+                'fps': fps, 'frame_stride_requested': frame_stride, 'max_frames': max_frames,
+                'source_frames': len(fields), 'title': title}
+    path.with_suffix('.json').write_text(json.dumps(json_safe(metadata), indent=2), encoding='utf8')
+    return {'path': path, **metadata}
+
+
 def render_training_visualizations(analysis: dict, output_dir, *, model_id="", fps=10,
                                    show_progress=True) -> dict[str, Path]:
     """Save profile/EP movies, all-pair mean maps, and a signed shell spectrum.

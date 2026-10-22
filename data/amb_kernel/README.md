@@ -41,9 +41,15 @@ Float64 field 파일은 모델당 약 **9.85 GiB**, 여섯 모델 약 59.1 GiB�
 
 기본값은 **M01 / primary / seed 73031 한 run**, **N=64**, DT=0.01, burn-in 10,000, measurement 1,000 step과 circle 초기 profile입니다. SELECTED_MODELS, CASE_NAMES, MODEL_OVERRIDES, SEEDS에서 필요한 비교만 명시적으로 선택합니다. 선택하지 않은 모델이나 control을 추가 실행하지 않습니다.
 
+선택한 run의 profile 영상은 실행 cell 다음에서 바로 재생합니다. RUN_TO_PLOT으로 run을 고르고 VIDEO_FRAME_STRIDE/VIDEO_MAX_FRAMES/VIDEO_FPS로 표시량과 재생 속도를 조절합니다. 첫·마지막 저장 frame을 포함하고 실제 물리 시간을 표시하며 컬러 범위를 고정합니다. 영상은 run 폴더의 `profile_video.html`, frame/time 목록은 `profile_video.json`으로 저장합니다. 저장되지 않은 burn-in은 포함하지 않습니다. 기존 결과는 import cell 실행 후 영상 cell에서 VIDEO_RUN_PATH를 기존 `runs/<run_id>` 폴더로 지정하면 시뮬레이션 없이 재생할 수 있습니다.
+
+설정 cell에는 M00 원형 클러스터 후보가 주석 예시로 있습니다: a=-1, b=1, kappa=2, g1=0.1, lambda0=0.05, D=0.01, phi_bar=-0.57, ell=1.2; circle 반경 N/4, width=2.1, amplitude=0.95. 약한 activity에서 두 상과 약 20%의 양의 상 면적을 목표로 한 시작값이며 장시간 안정성·정확한 coexistence의 보장은 아닙니다. 중심 고정력은 없습니다. Kernel 그림의 중앙 점은 point-source response K의 원점이고 초기 클러스터나 추가 시간 적분 실험이 아닙니다.
+
 DT_FACTORS=(1.0, 0.5, 0.25)로 dt 비교를 선택하면 burn-in/measurement/block 시간과 observation interval을 물리 시간 기준으로 맞춥니다. Integer step으로 표현할 수 없는 조합은 오류로 알립니다. Kernel의 full/odd component와 축 profile, field profile, 평균 phi², gradient energy, low-q structure factor, mass drift, solver residual을 확인합니다.
 
 물리 EPR는 integration-step midpoint work와 drift-minus-trace를 비교하고 signed shell/tail 기여와 seed/dt 요약을 따로 표시합니다. Observation pair의 finite-lag work는 streaming EPR와 구분합니다. M03의 b=0 run을 선택하면 analytic covariance와 EPR의 Gaussian calibration을 추가로 표시합니다. 결과는 `results/amb_kernel/sanity/<timestamp>/` 아래에 저장됩니다.
+
+`paired_method_comparison.csv`는 같은 trajectory의 두 추정값을 block별로 빼서 차이의 오차를 계산합니다. Block 독립성을 가정한 잠정 SE와, autocorrelation 길이 검사가 통과한 경우의 보정 SE를 구분합니다. Seed가 하나이면 seed SE는 미정이며 그림에는 잠정 within-run block SE를 사용합니다. 계산 불가능한 SE는 0으로 바꾸지 않습니다. 작은 SE만으로 stationarity나 dt 수렴을 판정하지 않습니다. `DT` 자체를 낮추면서 step 수를 유지하면 측정 물리 시간도 줄어드므로, dt 오차 비교에는 `DT_FACTORS`를 사용합니다.
 
 ## GPU와 진행 시간
 

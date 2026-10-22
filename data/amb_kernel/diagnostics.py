@@ -152,3 +152,42 @@ def summarize_blocks(block_values: dict, block_step_counts, *, dt: float,
                      "n_full_blocks": n_complete, "duration": n_steps * dt,
                      "uncertainty": "provisional_normal_approximation; check block independence"})
     return rows
+
+
+def compare_epr_methods(block_values: dict, block_step_counts, *, dt: float,
+                        full_block_steps: int) -> dict:
+    """Compare estimators on paired blocks of the SAME trajectory.
+
+    The provisional SE assumes independent complete blocks. A correlation-adjusted
+    SE is reported only when the autocorrelation length/window check passes.
+    Neither check establishes stationarity or absence of finite-dt bias.
+    """
+    counts = np.asarray(block_step_counts, dtype=np.int64)
+    midpoint = np.asarray(block_values['midpoint|total|all'], dtype=np.float64)
+    drift = np.asarray(block_values['drift_minus_trace|total|all'], dtype=np.float64)
+    if (counts.ndim != 1 or midpoint.shape != counts.shape or drift.shape != counts.shape
+            or not np.isfinite(midpoint).all() or not np.isfinite(drift).all()
+            or np.any(counts <= 0) or np.any(counts > full_block_steps)
+            or not np.isfinite(dt) or dt <= 0 or full_block_steps <= 0):
+        raise ValueError('Require finite aligned block rates, positive counts and dt.')
+    gap = midpoint - drift
+    complete = gap[counts == full_block_steps]
+    n = len(complete)
+    mean = float(np.dot(gap, counts) / counts.sum()) if counts.size else None
+    se = float(np.std(complete, ddof=1) / np.sqrt(n)) if n >= 2 else None
+    correlation = integrated_autocorrelation(complete, full_block_steps * dt)
+    adjusted = (se * np.sqrt(2 * correlation['tau_int_samples'])
+                if se is not None and correlation['reliable'] else None)
+    return {
+        'midpoint_minus_drift': mean,
+        'paired_block_SE_provisional': se,
+        'paired_block_SE_correlated': adjusted,
+        'gap_block_tau_samples': correlation['tau_int_samples'],
+        'gap_correlation_resolved': correlation['reliable'],
+        'gap_correlation_note': correlation['reason'],
+        'n_full_blocks': n,
+        'block_time': full_block_steps * dt,
+        'measurement_time': int(counts.sum()) * dt,
+        'uncertainty': 'Paired within-run blocks; provisional SE assumes independence. '
+                       'No stationarity or dt-convergence claim.',
+    }
