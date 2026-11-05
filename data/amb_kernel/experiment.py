@@ -432,6 +432,22 @@ def run_experiment(model_or_config, run_config: RunConfig | None = None,
                     accumulate(f"midpoint|{mechanism}|{shell}", -np.sum(nu * delta) / model.config.D)
                     equal_time = np.sum(active_old[key] * Lmu) / model.config.D - trace[key]
                     accumulate(f"drift_minus_trace|{mechanism}|{shell}", equal_time * cfg.dt)
+                # Exact discrete chain-rule audit for the onsite cubic source.
+                # For eta=0, mu_r0 = g2*K_r0(0)*phi**2, so its continuous-time
+                # work is a phi**3 boundary term. Keep the per-step midpoint,
+                # boundary, and cubic-increment correction on the same blocks.
+                if (model.config.model_id in {"M01", "M02", "M04"}
+                        and model.config.eta == 0 and "source:r0" in active_mid):
+                    center_weight = float(model.K_shells[0, 0, 0])
+                    prefactor = model.config.g2 * center_weight / model.config.D
+                    phi3_boundary_work = -prefactor * float(np.sum(phi**3 - old**3)) / 3
+                    cubic_increment = float(np.sum(delta**3))
+                    midpoint_r0_work = -float(np.sum(active_mid["source:r0"] * delta)) / model.config.D
+                    chain_correction = -prefactor * cubic_increment / 12
+                    accumulate("r0_phi3_boundary|source|r0", phi3_boundary_work)
+                    accumulate("r0_midpoint_chain_residual|source|r0",
+                               midpoint_r0_work - phi3_boundary_work - prefactor*cubic_increment/12)
+                    accumulate("r0_cubic_increment_correction|source|r0", chain_correction)
                 if model.config.model_id == "M02":
                     angular = _aggregates(model.angular_channels(midpoint), cfg.max_distance, np.zeros_like(phi))
                     for key, nu in angular.items():
