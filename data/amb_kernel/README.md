@@ -12,27 +12,28 @@
 ## 학습 notebook
 
 모델 목록과 물리 parameter를 설정한 뒤 순서대로 실행하면 dataset 생성 → training/validation → best checkpoint 복원 → 독립 test 평가 → 시각화가 이어집니다.
+생성과 학습은 별도 셀입니다. 학습은 `load_dataset(...).training_splits()`로 기존 자료를 열며, 학습 셀 재실행마다 새 checkpoint 폴더를 만듭니다. 커널 재시작 후에는 `DATASET_ROOT`에 기존 모델별 dataset을 포함한 상위 폴더를 지정하면 됩니다.
 
 | Split | 독립 trajectory | trajectory당 interval / frame | lag=1 pair 수 |
 |---|---:|---:|---:|
 | Train | 1,024 | 1,000 / 1,001 | 1,024,000 |
-| Validation | 256 | 1,000 / 1,001 | 256,000 |
-| Test | 10 | 1,000 / 1,001 | 10,000 |
+| Validation | 64 | 1,000 / 1,001 | 64,000 |
+| Test | 4 | 1,000 / 1,001 | 4,000 |
 
-현재 학습 notebook은 **M01 primary 하나만** 실행합니다. Sanity에서 선택한 a=-1, b=1, kappa=2, g1=g2=0.1, D=0.01, phi_bar=-0.57, ell=1.2를 사용합니다. 학습 grid는 **32×32**, TRAIN_DT=0.01, burn-in은 **3,000 step**, 측정은 1,000 step입니다. Trajectory 수는 기존 LABPM 규모를 따릅니다. 학습은 2,000 optimizer iterations, train/eval logical batch 2,048, gradient 누적 micro batch 32이며 H64/layers3/R3/ELU architecture를 사용합니다.
+현재 학습 notebook은 **M00 하나만** 실행합니다. a=-1, b=1, kappa=2, g1=0.2, lambda0=1, D=0.01, phi_bar=-0.56, ell=1을 사용합니다. 학습 grid는 **64×64**, TRAIN_DT=0.1, burn-in은 **10,000 step**, 측정은 1,000 step입니다. 학습은 3,000 optimizer iterations, train/eval logical batch 4,096, gradient 누적 micro batch 32이며 H32/layers3/R5/ELU architecture를 사용합니다. Learning rate는 1e-2, weight decay는 1e-3입니다.
 
-초기조건은 circle profile입니다. 학습 설정은 INITIAL_MODE='circle', INITIAL_NOISE_SCALE=0.0, CIRCLE_RADIUS_FRACTION=0.25, CIRCLE_WIDTH=2.1, CIRCLE_AMPLITUDE=0.95로 Sanity의 선택값을 반영합니다. Periodic distance를 이용한 tanh 경계의 원을 만든 뒤 초기 field의 평균을 한 번 phi_bar에 맞춥니다. 기본 반경은 학습 32×32에서 8, sanity 64×64에서 16 lattice units입니다. 초기 noise 설정은 초기 profile의 perturbation이며 dynamics의 D를 바꾸지 않습니다.
+초기조건은 circle profile입니다. INITIAL_MODE='circle', INITIAL_NOISE_SCALE=0.0, CIRCLE_RADIUS_FRACTION=0.25, CIRCLE_WIDTH=2, CIRCLE_AMPLITUDE=1을 사용합니다. Periodic distance를 이용한 tanh 경계의 원을 만든 뒤 초기 field의 평균을 한 번 phi_bar에 맞춥니다. 기본 반경은 64×64에서 16 lattice units입니다. 초기 noise 설정은 초기 profile의 perturbation이며 dynamics의 D를 바꾸지 않습니다.
 
 설정 다음 cell은 실제 초기조건 생성 함수로 만든 **t=0, burn-in 이전** field를 보여 줍니다. Circle은 초기조건이며 선택한 a/b와 noise 등에 따라 burn-in 동안 완화될 수 있습니다. 물리 계수를 바꾸어 모양을 고정하지 않습니다. Profile video는 burn-in 이후의 실제 held-out test frames를 그대로 사용합니다. 초기조건 설정은 RunConfig와 run/dataset manifest에 기록됩니다.
 
-Float64 field 파일은 현재 M01 한 모델에 약 **9.85 GiB**이며 진단과 checkpoint 공간이 추가됩니다. Trajectory별 저장과 read-only memory map을 사용하고, 모델별 학습·평가를 마치면 map을 닫습니다. 기존 dataset은 물리 설정·kernel·seed·backend·source가 일치하는 완료 자료만 재사용합니다.
+Float64 field 파일은 현재 M00 한 모델에 약 **33.36 GiB**이며 진단과 checkpoint 공간이 추가됩니다. Trajectory별 저장과 read-only memory map을 사용하고, 모델별 학습·평가를 마치면 map을 닫습니다. 기존 dataset은 물리 설정·kernel·seed·backend·source가 일치하는 완료 자료만 재사용합니다.
 
 학습 결과에서 다음을 확인합니다.
 
 - 실제 scalar phi profile 영상
 - 알려진 active work와 NN 예측을 비교하는 EP-map 영상
 - 전체 test 자료의 시간 평균 EP map
-- Signed EP shell spectrum
+- Signed EP shell spectrum: 평균 ± SD와 shell별 SD. 모든 test pair의 EP rate 표본 표준편차(ddof=1)이며 SE나 신뢰구간이 아닙니다. 평균과 SD는 CSV/NPZ에도 저장합니다.
 - Training/validation loss curve, checkpoint 및 정규화·loss·split 기록
 
 결과는 `results/amb_kernel/training/<timestamp>/` 아래에 저장됩니다. `visualizations/<model>/`의 `profile_video.html`, `ep_map_video.html`, `time_averaged_ep_map.png`, `ep_spectrum.png`에서 네 가지 시각화를 확인하고, 수치 자료는 `visualization_data.npz`, `ep_spectrum.csv`에 저장합니다. Parameter와 stationarity 검토에는 아래 sanity notebook을 사용합니다.

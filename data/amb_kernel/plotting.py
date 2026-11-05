@@ -190,26 +190,41 @@ def render_training_visualizations(analysis: dict, output_dir, *, model_id="", f
         raise ValueError("Shell labels and rates must have matching lengths.")
     labels = sorted(set(known_labels + nn_labels), key=lambda label: (label == "tail", int(label[1:]) if label.startswith("r") else 0))
     positions = {label: index for index, label in enumerate(labels)}
-    fig, axis = plt.subplots(figsize=(8.5, 4.7), dpi=130, layout="constrained")
+    fig, (axis, variation_axis) = plt.subplots(1, 2, figsize=(13, 4.7), dpi=130, layout="constrained")
+    known_std = analysis.get('known_shell_std')
+    nn_std = analysis.get('nn_shell_std')
     axis.bar([positions[label] - .2 for label in known_labels], known_rates, width=.4,
+             yerr=known_std, capsize=3,
              label="Known active-work attribution (finite lag)", color="darkorange")
     axis.bar([positions[label] + .2 for label in nn_labels], nn_rates, width=.4,
-             label="Learned raw NN branch", color="steelblue")
+             yerr=nn_std, capsize=3, label="Learned raw NN branch", color="steelblue")
     axis.axhline(0, color="black", linewidth=.8)
     axis.set_xticks(np.arange(len(labels)), labels)
     axis.set(xlabel="Chebyshev shell / physical tail", ylabel="signed extensive EP rate (1 / time)",
-             title=f"{prefix}EP shell spectrum")
+             title=f"{prefix}EP shell spectrum: mean ± pair SD")
     axis.legend(fontsize="small")
+    for shell_labels, std, offset, color, label in (
+            (known_labels, known_std, -.2, 'darkorange', 'Known active work'),
+            (nn_labels, nn_std, .2, 'steelblue', 'NN raw branch')):
+        if std is not None:
+            variation_axis.bar([positions[key] + offset for key in shell_labels], std,
+                               width=.4, color=color, label=label)
+    variation_axis.set_xticks(np.arange(len(labels)), labels)
+    variation_axis.set(xlabel="Chebyshev shell / physical tail", ylabel="SD of extensive EP rate (1 / time)",
+                       title="EP variation across all test pairs (not SE)")
+    if known_std is not None or nn_std is not None:
+        variation_axis.legend(fontsize="small")
     fig.savefig(paths["ep_spectrum_png"], dpi=150)
     plt.close(fig)
 
     with paths["ep_spectrum_csv"].open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=("quantity", "shell", "mean_extensive_rate"))
+        writer = csv.DictWriter(stream, fieldnames=("quantity", "shell", "mean_extensive_rate", "std_extensive_rate"))
         writer.writeheader()
-        for quantity, shell_labels, values in (("known_active_work_finite_lag", known_labels, known_rates),
-                                               ("NN_raw_branch", nn_labels, nn_rates)):
-            writer.writerows({"quantity": quantity, "shell": label, "mean_extensive_rate": float(value)}
-                            for label, value in zip(shell_labels, values))
+        for quantity, shell_labels, values, std in (("known_active_work_finite_lag", known_labels, known_rates, known_std),
+                                                    ("NN_raw_branch", nn_labels, nn_rates, nn_std)):
+            writer.writerows({"quantity": quantity, "shell": label, "mean_extensive_rate": float(value),
+                              "std_extensive_rate": None if std is None else float(std[index])}
+                             for index, (label, value) in enumerate(zip(shell_labels, values)))
     data = {key: value for key, value in analysis.items() if isinstance(value, np.ndarray)}
     data.update(known_shell_labels=np.asarray(known_labels), nn_shell_labels=np.asarray(nn_labels),
                 known_channel_labels=np.asarray(analysis.get("known_channel_labels", [])),

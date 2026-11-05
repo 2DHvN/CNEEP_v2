@@ -26,6 +26,28 @@ def _shell_order(label):
     return (1,0) if label=='tail' else (0,int(label[1:]))
 
 
+class _RateMoments:
+    """Merge per-pair shell moments without retaining pair histories."""
+    def __init__(self):
+        self.count = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, values):
+        values = np.asarray(values, dtype=np.float64)
+        count = len(values)
+        mean = values.mean(axis=0)
+        delta = mean - self.mean
+        total = self.count + count
+        self.m2 = (self.m2 + np.sum((values - mean) ** 2, axis=0)
+                   + delta ** 2 * self.count * count / total)
+        self.mean = self.mean + delta * count / total
+        self.count = total
+
+    def std(self):
+        return np.sqrt(self.m2 / (self.count - 1)) if self.count > 1 else np.full_like(self.mean, np.nan)
+
+
 def analyze_test_fields(fit, test_fields, physical, frame_dt, *, lag_frames=1,
                         batch_size=32, video_trajectory=0, video_stride=5,
                         video_max_frames=200, show_progress=True, time_offset=0.0):
@@ -80,6 +102,8 @@ def analyze_test_fields(fit, test_fields, physical, frame_dt, *, lag_frames=1,
     known_sum=np.zeros(physical.shape,dtype=np.float64)
     nn_sum=np.zeros(physical.shape,dtype=np.float64)
     channel_sum={}
+    known_moments, nn_moments = _RateMoments(), _RateMoments()
+    known_labels = None
     nn_spectrum_sum=None
     nn_labels=None
     video={key:[] for key in ('video_phi','video_phi_midpoint','video_known_ep_rate','video_nn_ep_rate',
@@ -115,18 +139,25 @@ def analyze_test_fields(fit, test_fields, physical, frame_dt, *, lag_frames=1,
                     nn_maps=branch_maps.sum(axis=1)
                     nn_sum+=nn_maps.sum(axis=0)
                     nn_spectrum_sum+=branch_maps.sum(axis=(0,2,3))
+                    nn_moments.update(branch_maps.sum(axis=(2,3)))
                     for local_index,start in enumerate(indices):
                         left,right=pairs[local_index]
                         midpoint=(left+right)/2
                         delta=right-left
                         known_map=np.zeros(physical.shape,dtype=np.float64)
                         channels=physical.active_channels(midpoint,max_distance=radius)
+                        shell_rates = {}
                         for label,nu in channels.items():
                             rate=-nu*delta/(physical.config.D*interval)
                             if not np.isfinite(rate).all():
                                 raise FloatingPointError('Nonfinite known-model endpoint EP maps.')
                             known_map+=rate
                             channel_sum[label]=channel_sum.get(label,0.0)+float(rate.sum())
+                            shell = label.split(':', 1)[1]
+                            shell_rates[shell] = shell_rates.get(shell, 0.0) + float(rate.sum())
+                        if known_labels is None:
+                            known_labels = sorted(shell_rates, key=_shell_order)
+                        known_moments.update([[shell_rates[key] for key in known_labels]])
                         known_sum+=known_map
                         ordinal=begin+local_index
                         if (trajectory_index==video_trajectory and ordinal%video_stride==0
@@ -156,6 +187,7 @@ def analyze_test_fields(fit, test_fields, physical, frame_dt, *, lag_frames=1,
     result.update(mean_known_ep_rate=known_sum/total_pairs,mean_nn_ep_rate=nn_sum/total_pairs,
                   nn_shell_labels=nn_labels,nn_shell_rates=nn_spectrum_sum/total_pairs,
                   known_shell_labels=known_labels,known_shell_rates=np.asarray([shells[key] for key in known_labels]),
+                  nn_shell_std=nn_moments.std(), known_shell_std=known_moments.std(),
                   known_channel_labels=channel_labels,known_channel_rates=channel_rates,
                   metadata={'model_id':physical.config.model_id,'n_sites':physical.N,'D':physical.config.D,
                       'total_pairs':total_pairs,'per_trajectory_pairs':pair_counts,'n_test_trajectories':len(trajectories),
@@ -169,6 +201,7 @@ def analyze_test_fields(fit, test_fields, physical, frame_dt, *, lag_frames=1,
                       'ep_time_coordinate':'interval midpoint','video_stride_changes_lag':False,
                       'map_units':'local dS / time; spatial sum is extensive rate, without an extra N factor',
                       'spectrum_units':'signed extensive EP rate per shell; mechanisms summed for known-shell spectrum',
+                      'spectrum_variation':'sample SD (ddof=1) of per-pair shell rates over all test pairs; not SE or CI',
                       'known_map':'model-defined active work at the observation-pair midpoint, not streaming integration-step EPR',
                       'learned_map':'trained thermodynamic-force work; its local attribution can differ by a gradient gauge',
                       'normalization':{'mean':float(normalizer.mean),'std':float(normalizer.std),'rule':'fixed training affine map; d_z dz=d_phi dphi'},
